@@ -1,49 +1,46 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    LURAPH TRACER — трассировка VM-обфусцированных скриптов
+    DELTA SCRIPT RIPPER — совместим с Delta Executor
     ─────────────────────────────────────────────────────────────────────────
-    Luraph / Ironbrew / Prometheus / и прочие VM-обфускаторы конвертируют
-    исходник в кастомный байткод. decompile() видит только VM-диспатчер.
-
-    ЭТОТ СКРИПТ работает по-другому:
-      • Перехватывает ВСЕ реальные вызовы Roblox API во время выполнения
-      • Скрипт может быть зашифрован как угодно — но в итоге ему надо
-        вызвать game:GetService, Instance.new, :Connect, FireServer и т.д.
-      • Мы логируем каждый такой вызов с аргументами
-      • На выходе — ПОЛНЫЙ ЛИСТ того что скрипт ДЕЛАЕТ
+    ПРАВИЛА DELTA:
+      • hookmetamethod ОБЯЗАТЕЛЬНО через newcclosure() — иначе краш
+      • hookfunction(Instance.new) — НЕ ИСПОЛЬЗОВАТЬ — крашит Delta
+      • checkcaller() — использовать ВНУТРИ хуков чтобы не ловить свои вызовы
+      • __newindex хук — НЕ ИСПОЛЬЗОВАТЬ — бесконечная рекурсия на Delta
 
     ПОРЯДОК:
       1) Запусти ЭТОТ скрипт
       2) Запусти обфусцированный скрипт (Luraph и т.п.)
-      3) Подожди 5-15 секунд пока он отработает
-      4) В чате напиши /dump — трассировка сохранится в файл
-      5) Или она автосохраняется каждые 10 секунд
+      3) Подожди пока он отработает
+      4) Напиши /dump в чат — трассировка сохранится
+      5) Или она автосохранится через 15 секунд и далее каждые 10 сек
 
-    ВЫХОД: workspace/LuraphTrace/<сессия>/
-      trace.lua          — все API вызовы как читаемый Lua-псевдокод
-      raw_log.txt        — полный лог с таймстампами
-      strings.txt        — все строки которые скрипт расшифровал/использовал
-      remotes.txt        — все FireServer / InvokeServer вызовы
-      instances.txt      — все созданные Instance
-      connections.txt    — все :Connect подключения
+    ВЫХОД: workspace/DeltaRip/<сессия>/
+      trace.lua       — все API вызовы как читаемый Lua-код
+      raw_log.txt     — полный лог
+      remotes.txt     — FireServer / InvokeServer
+      strings.txt     — все строки из памяти
+      http_N.lua      — тела HttpGet
+      loadstring_N.lua — перехваченные исходники
 ═══════════════════════════════════════════════════════════════════════════]]
 
 local genv = getgenv and getgenv() or _G
 
-if genv.__TRACER then
-	warn("[Tracer] Уже активен")
+if genv.__DELTA_RIP then
+	warn("[DeltaRip] Уже активен")
 	return
 end
-genv.__TRACER = true
+genv.__DELTA_RIP = true
 
 ---------------------------------------------------------------------------
 -- FS
 ---------------------------------------------------------------------------
 local hasFS = typeof(writefile) == "function"
-local ROOT = "LuraphTrace"
+local ROOT = "DeltaRip"
 local SESS do
 	local ok, d = pcall(os.date, "%Y-%m-%d_%H-%M-%S")
 	SESS = ROOT .. "/" .. (ok and d or tostring(math.floor(tick())))
 end
+local lsIdx, httpIdx = 0, 0
 
 local function dir(p)
 	if not hasFS then return end
@@ -53,10 +50,10 @@ local function w(path, txt)
 	if not hasFS then return end
 	pcall(writefile, path, tostring(txt))
 end
-local function msg(t, tx)
+local function msg(title, text)
 	pcall(function()
 		game:GetService("StarterGui"):SetCore("SendNotification",
-			{Title=t, Text=tx, Duration=5})
+			{Title = title, Text = text, Duration = 5})
 	end)
 end
 
@@ -64,16 +61,12 @@ dir(ROOT)
 dir(SESS)
 
 ---------------------------------------------------------------------------
--- ЛОГ
+-- ЛОГИРОВАНИЕ
 ---------------------------------------------------------------------------
-local rawLog = {}       -- полный лог
-local traceCode = {}    -- читаемый псевдокод
-local capturedStrings = {} -- все строки
-local remotes = {}      -- FireServer / InvokeServer
-local instances = {}    -- Instance.new
-local connections = {}  -- :Connect
-local varCounter = 0
-local instanceVars = {} -- Instance → имя переменной (для читаемости)
+local rawLog = {}
+local traceCode = {}
+local remoteCalls = {}
+local capturedStrings = {}
 local startTime = tick()
 local totalCalls = 0
 
@@ -81,332 +74,325 @@ local function ts()
 	return string.format("[%.2f]", tick() - startTime)
 end
 
--- Получить читаемое имя для значения
-local function repr(v, depth)
-	depth = depth or 0
-	if depth > 2 then return "..." end
+local function repr(v, d)
+	d = d or 0
+	if d > 2 then return "..." end
 	local t = typeof(v)
-
 	if t == "string" then
-		-- Запоминаем строку
-		if #v > 2 and not capturedStrings[v] then
-			capturedStrings[v] = true
-		end
-		if #v > 100 then
-			return '"' .. v:sub(1, 100):gsub('[%c\\"]', '.') .. '..."'
-		end
-		return '"' .. v:gsub('[%c\\"]', '.') .. '"'
-
-	elseif t == "number" then
+		capturedStrings[v] = true
+		if #v > 100 then return '"' .. v:sub(1,100):gsub('[%c\\"]','.') .. '..."' end
+		return '"' .. v:gsub('[%c\\"]','.') .. '"'
+	elseif t == "number" or t == "boolean" or t == "nil" then
 		return tostring(v)
-
-	elseif t == "boolean" then
-		return tostring(v)
-
-	elseif t == "nil" then
-		return "nil"
-
 	elseif t == "Instance" then
-		-- Даём переменную если ещё нет
-		if not instanceVars[v] then
-			local name = "unknown"
-			pcall(function() name = v.Name end)
-			local cls = "?"
-			pcall(function() cls = v.ClassName end)
-			instanceVars[v] = name .. "_" .. cls
-		end
-		local fullName = ""
-		pcall(function() fullName = v:GetFullName() end)
-		return fullName ~= "" and fullName or instanceVars[v]
-
-	elseif t == "Vector3" or t == "Vector2" or t == "CFrame"
-		or t == "Color3" or t == "UDim2" or t == "UDim"
-		or t == "BrickColor" or t == "Enum" or t == "EnumItem" then
-		return tostring(v)
-
+		local ok, n = pcall(function() return v:GetFullName() end)
+		return ok and n or "<Instance>"
 	elseif t == "table" then
 		local parts = {}
-		local count = 0
+		local cnt = 0
 		pcall(function()
 			for k, val in pairs(v) do
-				count = count + 1
-				if count > 8 then parts[#parts+1] = "..."; break end
+				cnt = cnt + 1
+				if cnt > 6 then parts[#parts+1] = "..."; break end
 				if type(k) == "number" then
-					parts[#parts+1] = repr(val, depth + 1)
+					parts[#parts+1] = repr(val, d+1)
 				else
-					parts[#parts+1] = tostring(k) .. "=" .. repr(val, depth + 1)
+					parts[#parts+1] = tostring(k) .. "=" .. repr(val, d+1)
 				end
 			end
 		end)
 		return "{" .. table.concat(parts, ", ") .. "}"
-
+	elseif t == "Vector3" or t == "Vector2" or t == "CFrame"
+		or t == "Color3" or t == "UDim2" or t == "UDim"
+		or t == "BrickColor" or t == "EnumItem" then
+		local ok, s = pcall(tostring, v)
+		return ok and s or "<" .. t .. ">"
 	elseif t == "function" then
 		return "<function>"
-
-	elseif t == "RBXScriptSignal" then
-		return "<Signal>"
-
-	elseif t == "RBXScriptConnection" then
-		return "<Connection>"
 	end
-
-	local ok, str = pcall(tostring, v)
-	return ok and str or "<" .. t .. ">"
+	local ok, s = pcall(tostring, v)
+	return ok and s or "<" .. t .. ">"
 end
 
 local function reprArgs(...)
-	local args = table.pack(...)
-	local parts = {}
-	for i = 1, args.n do
-		parts[i] = repr(args[i])
-	end
-	return table.concat(parts, ", ")
+	local a = table.pack(...)
+	local p = {}
+	for i = 1, a.n do p[i] = repr(a[i]) end
+	return table.concat(p, ", ")
 end
 
--- Логирование
-local function log(category, codeLine, rawLine)
+local function log(cat, code, raw)
 	totalCalls = totalCalls + 1
-	rawLog[#rawLog+1] = ts() .. " " .. (rawLine or codeLine)
-	if codeLine then
-		traceCode[#traceCode+1] = codeLine
+	if #rawLog < 20000 then
+		rawLog[#rawLog+1] = ts() .. " " .. (raw or code)
 	end
-	if category == "remote" then
-		remotes[#remotes+1] = ts() .. " " .. (rawLine or codeLine)
-	elseif category == "instance" then
-		instances[#instances+1] = codeLine
-	elseif category == "connect" then
-		connections[#connections+1] = ts() .. " " .. codeLine
+	if #traceCode < 15000 then
+		traceCode[#traceCode+1] = code
+	end
+	if cat == "remote" then
+		remoteCalls[#remoteCalls+1] = ts() .. " " .. (raw or code)
 	end
 end
 
 ---------------------------------------------------------------------------
--- ПЕРЕХВАТ __namecall (ВСЕ вызовы методов на всех Instance)
--- Это ГЛАВНЫЙ перехватчик — ловит всё что делает VM
+-- ХУК __namecall — ГЛАВНЫЙ ПЕРЕХВАТЧИК
+-- ОБЯЗАТЕЛЬНО newcclosure() на Delta!!!
 ---------------------------------------------------------------------------
-if typeof(hookmetamethod) == "function" then
+if typeof(hookmetamethod) == "function" and typeof(newcclosure) == "function" then
 	pcall(function()
 		local oldNC
-		oldNC = hookmetamethod(game, "__namecall", function(self, ...)
+		oldNC = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			local method = getnamecallmethod()
-			local args = table.pack(...)
 
-			-- Не логируем наши собственные вызовы
-			if typeof(checkcaller) == "function" then
-				local ok, isSelf = pcall(checkcaller)
-				if ok and isSelf then
-					return oldNC(self, ...)
-				end
+			-- Пропускаем свои вызовы (Delta поддерживает checkcaller)
+			if checkcaller() then
+				return oldNC(self, ...)
 			end
 
 			local selfName = ""
 			pcall(function() selfName = self:GetFullName() end)
-			local cls = ""
-			pcall(function() cls = self.ClassName end)
-
 			local argsStr = reprArgs(...)
 
-			-- ── КАТЕГОРИЗАЦИЯ ──────────────────────────────────────
-
-			-- FireServer / InvokeServer — самое важное
-			if method == "FireServer" or method == "InvokeServer"
-				or method == "fireServer" or method == "invokeServer" then
+			-- ── FireServer / InvokeServer ──
+			if method == "FireServer" or method == "InvokeServer" then
 				log("remote",
 					selfName .. ":" .. method .. "(" .. argsStr .. ")",
 					"[REMOTE] " .. selfName .. ":" .. method .. "(" .. argsStr .. ")")
 
-			-- Connect — подписка на события
-			elseif method == "Connect" or method == "connect"
-				or method == "Once" or method == "once" then
-				log("connect",
-					selfName .. "." .. (args.n > 0 and "" or "Event") .. ":" .. method .. "(<callback>)",
-					"[CONNECT] " .. selfName .. ":" .. method)
-
-			-- HttpGet
+			-- ── HttpGet ──
 			elseif method == "HttpGet" or method == "HttpGetAsync" then
-				log("http",
-					'game:' .. method .. '(' .. argsStr .. ')',
-					"[HTTP] " .. method .. " " .. tostring(args[1] or ""))
+				local url = tostring(select(1, ...) or "")
+				log("api", 'game:' .. method .. '("' .. url:sub(1,80) .. '")')
 
-			-- GetService
+				-- Сохраняем ответ
+				local results = table.pack(oldNC(self, ...))
+				if type(results[1]) == "string" and #results[1] > 0 then
+					task.spawn(function()
+						pcall(function()
+							httpIdx = httpIdx + 1
+							w(SESS .. "/http_" .. httpIdx .. ".lua",
+								"-- URL: " .. url .. "\n-- size: " .. #results[1] .. "\n\n" .. results[1])
+						end)
+					end)
+				end
+				return table.unpack(results, 1, results.n)
+
+			-- ── Connect ──
+			elseif method == "Connect" or method == "connect" or method == "Once" then
+				log("api", selfName .. ":" .. method .. "(<callback>)")
+
+			-- ── GetService ──
 			elseif method == "GetService" then
-				log("api",
-					'game:GetService(' .. argsStr .. ')',
-					"[SERVICE] " .. tostring(args[1] or ""))
+				log("api", 'game:GetService(' .. argsStr .. ')')
 
-			-- FindFirstChild / WaitForChild
-			elseif method == "FindFirstChild" or method == "WaitForChild"
-				or method == "FindFirstChildOfClass" or method == "FindFirstChildWhichIsA" then
-				log("api",
-					selfName .. ':' .. method .. '(' .. argsStr .. ')')
+			-- ── Instance manipulation ──
+			elseif method == "Clone" or method == "Destroy" or method == "Remove" then
+				log("api", selfName .. ':' .. method .. '()')
 
-			-- Clone, Destroy, Remove
-			elseif method == "Clone" or method == "Destroy" or method == "Remove"
-				or method == "ClearAllChildren" then
-				log("api",
-					selfName .. ':' .. method .. '()')
-
-			-- TweenService:Create
-			elseif method == "Create" and cls == "TweenService" then
-				log("api",
-					'TweenService:Create(' .. argsStr .. ')')
-
-			-- Play, Stop (для Tween, Sound, Animation)
-			elseif method == "Play" or method == "Stop" or method == "Pause"
-				or method == "Resume" or method == "AdjustSpeed" then
-				log("api",
-					selfName .. ':' .. method .. '(' .. argsStr .. ')')
-
-			-- SetPrimaryPartCFrame / PivotTo
-			elseif method == "SetPrimaryPartCFrame" or method == "PivotTo"
-				or method == "MoveTo" or method == "TranslateBy" then
-				log("api",
-					selfName .. ':' .. method .. '(' .. argsStr .. ')')
-
-			-- Kick
-			elseif method == "Kick" then
-				log("api",
-					selfName .. ':Kick(' .. argsStr .. ')',
-					"[KICK] " .. selfName .. " : " .. argsStr)
-
-			-- Teleport
-			elseif method == "Teleport" or method == "TeleportToPlaceInstance" then
+			-- ── Teleport / Kick ──
+			elseif method == "Kick" or method == "Teleport" then
 				log("api",
 					selfName .. ':' .. method .. '(' .. argsStr .. ')',
-					"[TELEPORT] " .. argsStr)
+					"[" .. method:upper() .. "] " .. argsStr)
 
-			-- Всё остальное тоже логируем (но менее подробно)
-			else
-				-- Фильтруем шум: не логируем слишком частые вызовы
-				if method ~= "IsA" and method ~= "IsDescendantOf"
-					and method ~= "IsAncestorOf" and method ~= "GetPropertyChangedSignal"
-					and method ~= "GetChildren" and method ~= "GetDescendants" then
-					log("api",
-						selfName .. ':' .. method .. '(' .. argsStr .. ')')
+			-- ── WaitForChild / FindFirstChild ──
+			elseif method == "FindFirstChild" or method == "WaitForChild"
+				or method == "FindFirstChildOfClass" or method == "FindFirstChildWhichIsA" then
+				log("api", selfName .. ':' .. method .. '(' .. argsStr .. ')')
+
+			-- ── MoveTo / TweenService ──
+			elseif method == "MoveTo" or method == "PivotTo" or method == "Create" then
+				log("api", selfName .. ':' .. method .. '(' .. argsStr .. ')')
+
+			-- ── Play / Stop (Sound, Tween, Animation) ──
+			elseif method == "Play" or method == "Stop" or method == "Pause" then
+				log("api", selfName .. ':' .. method .. '()')
+
+			-- ── SetAttribute / GetAttribute ──
+			elseif method == "SetAttribute" or method == "GetAttribute" then
+				log("api", selfName .. ':' .. method .. '(' .. argsStr .. ')')
+
+			-- ── Прочее (фильтруем шум) ──
+			elseif method ~= "IsA" and method ~= "IsDescendantOf"
+				and method ~= "IsAncestorOf" and method ~= "GetPropertyChangedSignal"
+				and method ~= "GetChildren" and method ~= "GetDescendants"
+				and method ~= "GetFullName" and method ~= "FindFirstAncestor" then
+				log("api", selfName .. ':' .. method .. '(' .. argsStr .. ')')
+			end
+
+			return oldNC(self, ...)
+		end))
+	end)
+	print("[DeltaRip] __namecall hook ✓ (через newcclosure)")
+elseif typeof(hookmetamethod) == "function" then
+	-- Без newcclosure — рискованно, но пробуем
+	warn("[DeltaRip] newcclosure не найден! __namecall хук может крашнуть")
+	pcall(function()
+		local oldNC
+		oldNC = hookmetamethod(game, "__namecall", function(self, ...)
+			local method = getnamecallmethod()
+			if typeof(checkcaller) == "function" and checkcaller() then
+				return oldNC(self, ...)
+			end
+			local selfName = ""
+			pcall(function() selfName = self:GetFullName() end)
+			local argsStr = reprArgs(...)
+
+			if method == "FireServer" or method == "InvokeServer" then
+				log("remote", selfName .. ":" .. method .. "(" .. argsStr .. ")")
+			elseif method == "HttpGet" or method == "HttpGetAsync" then
+				log("api", 'game:' .. method .. '(' .. argsStr .. ')')
+				local res = table.pack(oldNC(self, ...))
+				if type(res[1]) == "string" and #res[1] > 0 then
+					task.spawn(function() pcall(function()
+						httpIdx = httpIdx + 1
+						w(SESS .. "/http_" .. httpIdx .. ".lua", "-- " .. tostring(select(1,...) or "") .. "\n\n" .. res[1])
+					end) end)
 				end
+				return table.unpack(res, 1, res.n)
+			elseif method ~= "IsA" and method ~= "GetChildren" and method ~= "GetDescendants"
+				and method ~= "GetFullName" and method ~= "IsDescendantOf" then
+				log("api", selfName .. ":" .. method .. "(" .. argsStr .. ")")
 			end
 
 			return oldNC(self, ...)
 		end)
 	end)
-	print("[Tracer] __namecall hook ✓ (ВСЕ вызовы методов)")
+	print("[DeltaRip] __namecall hook ✓ (без newcclosure — может быть нестабильно)")
+else
+	warn("[DeltaRip] hookmetamethod недоступен!")
 end
 
 ---------------------------------------------------------------------------
--- ПЕРЕХВАТ __newindex (запись свойств)
----------------------------------------------------------------------------
-if typeof(hookmetamethod) == "function" then
-	pcall(function()
-		local oldNI
-		oldNI = hookmetamethod(game, "__newindex", function(self, key, value)
-			-- Не логируем свои вызовы
-			if typeof(checkcaller) == "function" then
-				local ok, isSelf = pcall(checkcaller)
-				if ok and isSelf then
-					return oldNI(self, key, value)
-				end
-			end
-
-			local selfName = ""
-			pcall(function() selfName = self:GetFullName() end)
-
-			-- Важные свойства
-			if type(key) == "string" then
-				local val = repr(value)
-				if key == "Parent" then
-					log("api",
-						selfName .. ".Parent = " .. val,
-						"[PARENT] " .. selfName .. " → " .. val)
-				elseif key == "CFrame" or key == "Position" or key == "Size"
-					or key == "Transparency" or key == "Visible" or key == "Text"
-					or key == "Value" or key == "Enabled" or key == "Name" then
-					log("api", selfName .. "." .. key .. " = " .. val)
-				end
-			end
-
-			return oldNI(self, key, value)
-		end)
-	end)
-	print("[Tracer] __newindex hook ✓ (запись свойств)")
-end
-
----------------------------------------------------------------------------
--- ПЕРЕХВАТ Instance.new
----------------------------------------------------------------------------
-if typeof(hookfunction) == "function" then
-	pcall(function()
-		local origNew = Instance.new
-		local oldNew
-		oldNew = hookfunction(Instance.new, function(cls, parent, ...)
-			local result = oldNew(cls, parent, ...)
-
-			if typeof(checkcaller) == "function" then
-				local ok, isSelf = pcall(checkcaller)
-				if ok and isSelf then return result end
-			end
-
-			varCounter = varCounter + 1
-			local varName = "v" .. varCounter
-			local parentStr = ""
-			if parent then
-				pcall(function() parentStr = ", " .. parent:GetFullName() end)
-			end
-			instanceVars[result] = varName
-			log("instance",
-				"local " .. varName .. ' = Instance.new("' .. tostring(cls) .. '"' .. parentStr .. ')',
-				"[NEW] " .. tostring(cls) .. parentStr)
-
-			return result
-		end)
-	end)
-	print("[Tracer] Instance.new hook ✓")
-end
-
----------------------------------------------------------------------------
--- ПЕРЕХВАТ loadstring — ловим сам обфусцированный скрипт + внутренние
+-- ХУК loadstring — ловим исходники и decompile
+-- Прямая подмена (НЕ hookfunction) — безопаснее на Delta
 ---------------------------------------------------------------------------
 local origLS = genv.loadstring or loadstring
+
 if typeof(origLS) == "function" then
-	pcall(function()
-		local hook = function(src, name)
-			local fn, err = origLS(src, name)
+	local hook = function(src, name)
+		local fn, err
+		pcall(function() fn, err = origLS(src, name) end)
 
-			task.spawn(function()
-				pcall(function()
-					-- Сохраняем RAW
-					if type(src) == "string" and #src > 0 then
-						local idx = #rawLog
-						w(SESS .. "/loadstring_" .. idx .. "_raw.lua",
-							"-- chunk: " .. tostring(name or "?")
-							.. "\n-- size: " .. #src .. "\n\n" .. src)
-						print("[Tracer] loadstring перехвачен: " .. #src .. " chars")
+		task.spawn(function()
+			pcall(function()
+				lsIdx = lsIdx + 1
+				local folder = SESS .. "/ls_" .. lsIdx
+				dir(folder)
 
-						-- Пробуем decompile
-						if typeof(decompile) == "function" and typeof(fn) == "function" then
-							local ok, dec = pcall(decompile, fn)
-							if ok and type(dec) == "string" and #dec > 5 then
-								w(SESS .. "/loadstring_" .. idx .. "_decompiled.lua", dec)
-								print("[Tracer] decompile OK: " .. #dec .. " chars")
+				-- RAW source
+				if type(src) == "string" and #src > 0 then
+					w(folder .. "/raw.lua",
+						"-- chunk: " .. tostring(name or "?")
+						.. "\n-- size: " .. #src .. "\n\n" .. src)
+				end
+
+				-- decompile
+				if typeof(decompile) == "function" and typeof(fn) == "function" then
+					local ok, dec = pcall(decompile, fn)
+					if ok and type(dec) == "string" and #dec > 5 then
+						w(folder .. "/decompiled.lua", dec)
+					end
+				end
+
+				-- getgc + constants + upvalues + protos
+				if typeof(fn) == "function" then
+					local lines = {"=== FUNCTION TREE ===", ""}
+					local vis = {}
+
+					local function walk(f, depth)
+						if depth > 6 or vis[f] then return end
+						if typeof(f) ~= "function" then return end
+						vis[f] = true
+
+						if typeof(iscclosure) == "function" then
+							local ok, c = pcall(iscclosure, f)
+							if ok and c then return end
+						end
+
+						local info = {}
+						if debug and typeof(debug.getinfo) == "function" then
+							pcall(function() info = debug.getinfo(f) or {} end)
+						end
+
+						local pad = ("  "):rep(depth)
+						lines[#lines+1] = pad .. string.format("fn [%s] L%s-%s p=%s",
+							tostring(info.short_src or "?"):sub(1,40),
+							tostring(info.linedefined or "?"),
+							tostring(info.lastlinedefined or "?"),
+							tostring(info.nparams or "?"))
+
+						if typeof(getconstants) == "function" then
+							local ok, cs = pcall(getconstants, f)
+							if ok and type(cs) == "table" and #cs > 0 then
+								local p = {}
+								for i, c in ipairs(cs) do
+									if i > 80 then p[#p+1] = "..."; break end
+									if type(c) == "string" then
+										capturedStrings[c] = true
+										p[#p+1] = (#c > 60) and ('"'..c:sub(1,60):gsub('[%c\\"]','.')..'"') or ('"'..c:gsub('[%c\\"]','.')..'"')
+									elseif c ~= nil then
+										p[#p+1] = tostring(c)
+									end
+								end
+								lines[#lines+1] = pad .. "  K["..#cs.."]: " .. table.concat(p, ", ")
+							end
+						end
+
+						if typeof(getupvalues) == "function" then
+							local ok, uvs = pcall(getupvalues, f)
+							if ok and type(uvs) == "table" then
+								for i, uv in ipairs(uvs) do
+									if i > 40 then break end
+									if type(uv) == "string" then
+										capturedStrings[uv] = true
+										lines[#lines+1] = pad .. "  uv"..i..'="'..uv:sub(1,60):gsub('[%c\\"]','.')..'"'
+									elseif typeof(uv) == "function" then
+										walk(uv, depth+1)
+									end
+								end
+							end
+						end
+
+						if typeof(getprotos) == "function" then
+							local ok, ps = pcall(getprotos, f)
+							if ok and type(ps) == "table" then
+								for i, p in ipairs(ps) do
+									if i > 40 then break end
+									if typeof(p) == "function" then walk(p, depth+1) end
+								end
 							end
 						end
 					end
 
-					log("api",
-						'loadstring(<' .. (type(src) == "string" and #src or 0) .. ' chars>, '
-						.. repr(name) .. ')')
-				end)
+					walk(fn, 0)
+					w(folder .. "/functions.txt", table.concat(lines, "\n"))
+				end
+
+				print("[DeltaRip] loadstring #" .. lsIdx .. " → " .. folder)
+				log("api", 'loadstring(<' .. (type(src)=="string" and #src or 0) .. ' chars>)')
 			end)
+		end)
 
-			return fn, err
-		end
+		return fn, err
+	end
 
-		genv.loadstring = hook
-		pcall(function() _G.loadstring = hook end)
-	end)
-	print("[Tracer] loadstring hook ✓")
+	pcall(function() genv.loadstring = hook end)
+	pcall(function() _G.loadstring = hook end)
+
+	-- hookfunction как резерв
+	if genv.loadstring ~= hook and typeof(hookfunction) == "function" then
+		pcall(function()
+			local old = hookfunction(origLS, hook)
+			if typeof(old) == "function" then origLS = old end
+		end)
+	end
+
+	print("[DeltaRip] loadstring hook ✓")
 end
 
 ---------------------------------------------------------------------------
--- ПЕРЕХВАТ HttpGet через хук (дополнительно к __namecall)
+-- ХУК request / http_request / syn_request
 ---------------------------------------------------------------------------
 for _, rn in ipairs({"request", "http_request", "syn_request"}) do
 	if typeof(genv[rn]) == "function" then
@@ -417,9 +403,10 @@ for _, rn in ipairs({"request", "http_request", "syn_request"}) do
 				pcall(function()
 					if type(opts) == "table" and type(opts.Url) == "string"
 						and type(res[1]) == "table" and type(res[1].Body) == "string" then
-						w(SESS .. "/request_" .. tostring(opts.Url):gsub("[^%w]","_"):sub(1,40) .. ".lua",
+						httpIdx = httpIdx + 1
+						w(SESS .. "/req_" .. httpIdx .. ".lua",
 							"-- " .. opts.Url .. "\n\n" .. res[1].Body)
-						log("http", rn .. '({Url="' .. opts.Url:sub(1,80) .. '", ...})')
+						log("api", rn .. '({Url="' .. opts.Url:sub(1,80) .. '"})')
 					end
 				end)
 				return unpack(res)
@@ -429,123 +416,111 @@ for _, rn in ipairs({"request", "http_request", "syn_request"}) do
 end
 
 ---------------------------------------------------------------------------
--- СОХРАНЕНИЕ ТРАССИРОВКИ
+-- GC SCAN — вытащить строки из памяти (через 10 сек после запуска)
 ---------------------------------------------------------------------------
-local function saveTrace()
-	if totalCalls == 0 then return end
-
-	-- Основной псевдокод
-	local header = table.concat({
-		"-- ═══════════════════════════════════════════════════",
-		"-- LURAPH TRACE — восстановленная логика скрипта",
-		"-- Сессия: " .. SESS,
-		"-- Всего API вызовов: " .. totalCalls,
-		"-- Время трассировки: " .. string.format("%.1f", tick() - startTime) .. " сек",
-		"-- ═══════════════════════════════════════════════════",
-		"",
-	}, "\n")
-	w(SESS .. "/trace.lua", header .. table.concat(traceCode, "\n"))
-
-	-- Полный лог
-	w(SESS .. "/raw_log.txt", table.concat(rawLog, "\n"))
-
-	-- Строки
-	local strList = {}
-	for s in pairs(capturedStrings) do
-		if #s > 2 and #s < 5000 then strList[#strList+1] = s end
-	end
-	table.sort(strList, function(a, b) return #a > #b end)
-	w(SESS .. "/strings.txt", table.concat(strList, "\n---\n"))
-
-	-- Remote вызовы
-	if #remotes > 0 then
-		w(SESS .. "/remotes.txt", table.concat(remotes, "\n"))
-	end
-
-	-- Инстансы
-	if #instances > 0 then
-		w(SESS .. "/instances.txt", table.concat(instances, "\n"))
-	end
-
-	-- Коннекты
-	if #connections > 0 then
-		w(SESS .. "/connections.txt", table.concat(connections, "\n"))
-	end
-
-	print(("[Tracer] Сохранено: %d вызовов, %d строк → %s"):format(
-		totalCalls, #strList, SESS))
-end
-
--- Автосохранение каждые 10 секунд
-task.spawn(function()
-	while genv.__TRACER do
-		task.wait(10)
-		pcall(saveTrace)
-	end
-end)
-
--- Команда /dump в чате
-pcall(function()
-	local Players = game:GetService("Players")
-	local lp = Players.LocalPlayer
-	if lp then
-		pcall(function()
-			lp.Chatted:Connect(function(m)
-				if m:lower() == "/dump" then
-					pcall(saveTrace)
-					msg("Tracer", "Трассировка сохранена! " .. totalCalls .. " вызовов")
-				end
-			end)
-		end)
-	end
-end)
-
--- Сохранение при выходе
-pcall(function()
-	game:BindToClose(function()
-		pcall(saveTrace)
-	end)
-end)
-
----------------------------------------------------------------------------
--- GC СКАН — дополнительно вытащить строки из памяти
----------------------------------------------------------------------------
-task.delay(8, function()
+task.delay(10, function()
 	pcall(function()
 		if typeof(getgc) ~= "function" then return end
-		local objects = getgc()
-		if type(objects) ~= "table" then return end
+		local objs = getgc()
+		if type(objs) ~= "table" then return end
 
-		local codeFragments = {}
-		for _, obj in ipairs(objects) do
-			if type(obj) == "string" and #obj > 30 and #obj < 50000 then
-				-- Проверяем на код
+		local code = {}
+		for _, obj in ipairs(objs) do
+			if type(obj) == "string" and #obj > 25 and #obj < 100000 then
 				local n = 0
-				for _, kw in ipairs({"function","local ","end","return","then","game","require"}) do
+				for _, kw in ipairs({"function","local ","end","return","then","game","require","loadstring"}) do
 					if obj:find(kw, 1, true) then n = n + 1 end
 				end
-				if n >= 2 then
-					codeFragments[#codeFragments+1] = obj
-				end
+				if n >= 2 then code[#code+1] = obj end
 			end
 		end
 
-		if #codeFragments > 0 then
-			table.sort(codeFragments, function(a, b) return #a > #b end)
-			local out = {"-- [Tracer] CODE FRAGMENTS FROM GC MEMORY", "-- Count: " .. #codeFragments, ""}
-			for i, s in ipairs(codeFragments) do
-				if i > 100 then break end
+		if #code > 0 then
+			table.sort(code, function(a,b) return #a > #b end)
+			local out = {"-- GC CODE STRINGS: " .. #code, ""}
+			for i, s in ipairs(code) do
+				if i > 150 then break end
 				out[#out+1] = "-- [" .. i .. "] len=" .. #s
 				out[#out+1] = s
 				out[#out+1] = ""
 			end
 			w(SESS .. "/gc_code.txt", table.concat(out, "\n"))
-			print("[Tracer] GC scan: " .. #codeFragments .. " code fragments")
+			print("[DeltaRip] GC: " .. #code .. " code fragments")
+		end
+
+		-- Все строки с URL
+		local urls = {}
+		for _, obj in ipairs(objs) do
+			if type(obj) == "string" and obj:find("https?://") then
+				urls[#urls+1] = obj
+			end
+		end
+		if #urls > 0 then
+			w(SESS .. "/gc_urls.txt", table.concat(urls, "\n"))
 		end
 	end)
 end)
 
 ---------------------------------------------------------------------------
-print("[Tracer] ══ ACTIVE ══ Запускай Luraph скрипт → workspace/" .. SESS)
-print("[Tracer] Напиши /dump в чат чтобы сохранить трассировку")
-msg("LuraphTracer", "ACTIVE! Запускай скрипт, потом /dump")
+-- СОХРАНЕНИЕ
+---------------------------------------------------------------------------
+local function saveAll()
+	if totalCalls == 0 and lsIdx == 0 then return end
+
+	w(SESS .. "/trace.lua", table.concat({
+		"-- ═══ DELTA RIP TRACE ═══",
+		"-- Calls: " .. totalCalls,
+		"-- Time: " .. string.format("%.1f", tick()-startTime) .. "s",
+		"-- ═══════════════════════",
+		"",
+		table.concat(traceCode, "\n")
+	}, "\n"))
+
+	w(SESS .. "/raw_log.txt", table.concat(rawLog, "\n"))
+
+	if #remoteCalls > 0 then
+		w(SESS .. "/remotes.txt", table.concat(remoteCalls, "\n"))
+	end
+
+	local strList = {}
+	for s in pairs(capturedStrings) do
+		if #s > 2 and #s < 10000 then strList[#strList+1] = s end
+	end
+	if #strList > 0 then
+		table.sort(strList, function(a,b) return #a > #b end)
+		w(SESS .. "/strings.txt", table.concat(strList, "\n---\n"))
+	end
+
+	print(("[DeltaRip] Saved: %d calls, %d remotes, %d strings → %s"):format(
+		totalCalls, #remoteCalls, #strList, SESS))
+end
+
+-- Автосохранение
+task.spawn(function()
+	task.wait(15) -- первое сохранение через 15 сек
+	while genv.__DELTA_RIP do
+		pcall(saveAll)
+		task.wait(10)
+	end
+end)
+
+-- /dump команда
+pcall(function()
+	local lp = game:GetService("Players").LocalPlayer
+	if lp then
+		lp.Chatted:Connect(function(m)
+			if m:lower() == "/dump" then
+				pcall(saveAll)
+				msg("DeltaRip", totalCalls .. " вызовов сохранено!")
+			end
+		end)
+	end
+end)
+
+-- При выходе
+pcall(function() game:BindToClose(function() pcall(saveAll) end) end)
+
+---------------------------------------------------------------------------
+print("[DeltaRip] ══ ACTIVE ══ Запускай скрипт → workspace/" .. SESS)
+print("[DeltaRip] Через 15сек автосохранение, или /dump в чат")
+msg("DeltaRip", "ACTIVE! Запускай скрипт → " .. ROOT)
