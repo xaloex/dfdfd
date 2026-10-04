@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    LURAPH v15 DUMPER / UNPACKER  —  v2
+    LURAPH v15 DUMPER / UNPACKER  —  v21
 
     ПОЧЕМУ В ПРЕДЫДУЩЕЙ ВЕРСИИ НИЧЕГО НЕ ДЕКОМПИЛИРОВАЛОСЬ (7 реальных багов):
       1) hookmetamethod(game,"__namecall", newcclosure(function() ... oldNC ... end))
@@ -971,7 +971,254 @@ function S.scanRemotes()
 end
 
 ---------------------------------------------------------------------------
--- 11. УСТАНОВКА ВСЕГО
+-- 11. СОВМЕСТИМОСТЬ (шимы)
+-- Захваченный payload требует bit32 (16 обращений), setfenv, unpack и load.
+-- В этом эксплоите их НЕТ -> VM Luraph v15 падает на первой строке
+-- (Oq=bit32.band) и payload не выполняется вообще. Ставим шимы ДО payload.
+---------------------------------------------------------------------------
+local function toU32(x)
+	x = tonumber(x) or 0
+	return math.floor(x) % 4294967296
+end
+
+local function luaBand(a, b)
+	local res, bitv = 0, 1
+	a, b = toU32(a), toU32(b)
+	for _ = 1, 32 do
+		if a % 2 == 1 and b % 2 == 1 then res = res + bitv end
+		a = (a - a % 2) / 2
+		b = (b - b % 2) / 2
+		bitv = bitv * 2
+	end
+	return res
+end
+
+local function luaBor(a, b)
+	local res, bitv = 0, 1
+	a, b = toU32(a), toU32(b)
+	for _ = 1, 32 do
+		if a % 2 == 1 or b % 2 == 1 then res = res + bitv end
+		a = (a - a % 2) / 2
+		b = (b - b % 2) / 2
+		bitv = bitv * 2
+	end
+	return res
+end
+
+local function luaBxor(a, b)
+	local res, bitv = 0, 1
+	a, b = toU32(a), toU32(b)
+	for _ = 1, 32 do
+		if (a % 2) ~= (b % 2) then res = res + bitv end
+		a = (a - a % 2) / 2
+		b = (b - b % 2) / 2
+		bitv = bitv * 2
+	end
+	return res
+end
+
+-- ВАЖНО: нельзя писать x * 2^n напрямую — при x ~ 2^32 и n = 31
+-- промежуточное значение ~9.2e18 вылезает за 2^53 и double теряет биты.
+-- Поэтому всегда сначала режем по модулю, потом умножаем.
+local function luaLshift(x, n)
+	n = n % 32
+	local u = toU32(x)
+	if n == 0 then return u end
+	return (u % (2 ^ (32 - n))) * (2 ^ n)
+end
+
+local function luaRshift(x, n)
+	n = n % 32
+	if n == 0 then return toU32(x) end
+	return math.floor(toU32(x) / (2 ^ n))
+end
+
+local function luaRrotate(x, n)
+	n = n % 32
+	local u = toU32(x)
+	if n == 0 then return u end
+	local low = math.floor(u / (2 ^ n))
+	local high = (u % (2 ^ n)) * (2 ^ (32 - n))
+	return (low + high) % 4294967296
+end
+
+local function luaLrotate(x, n)
+	n = n % 32
+	local u = toU32(x)
+	if n == 0 then return u end
+	local high = (u % (2 ^ (32 - n))) * (2 ^ n)
+	local low = math.floor(u / (2 ^ (32 - n)))
+	return (high + low) % 4294967296
+end
+
+local function luaArshift(x, n)
+	n = n % 32
+	local u = toU32(x)
+	local s = (u >= 2147483648) and (u - 4294967296) or u
+	local r = (n == 0) and s or math.floor(s / (2 ^ n))
+	if r >= 2147483648 then return r - 4294967296 end
+	return r
+end
+
+local function luaExtract(n, field, width)
+	field = field % 32
+	width = width % 32
+	if width == 0 then return 0 end
+	return math.floor(toU32(n) / (2 ^ field)) % (2 ^ width)
+end
+
+local function luaReplace(n, v, field, width)
+	field = field % 32
+	width = width % 32
+	if width == 0 then return toU32(n) end
+	local u = toU32(n)
+	local cleared = u - (math.floor(u / (2 ^ field)) % (2 ^ width)) * (2 ^ field)
+	return (cleared + (toU32(v) % (2 ^ width)) * (2 ^ field)) % 4294967296
+end
+
+local function makeBit32()
+	local bitlib = rawget(_G, "bit")
+	if type(bitlib) ~= "table" then bitlib = rawget(genv, "bit") end
+	local B, origin = {}, "pure-lua"
+
+	local function fast(name)
+		return type(bitlib) == "table" and type(bitlib[name]) == "function"
+	end
+
+	if fast("band") then
+		origin = "bit"
+		B.band = function(a, b) return toU32(bitlib.band(a, b)) end
+		B.bor = function(a, b) return toU32(bitlib.bor(a, b)) end
+		B.bxor = function(a, b) return toU32(bitlib.bxor(a, b)) end
+		B.bnot = function(a) return toU32(bitlib.bnot(a)) end
+		B.lshift = function(a, n) return toU32(bitlib.lshift(a, n)) end
+		B.rshift = function(a, n) return toU32(bitlib.rshift(a, n)) end
+		B.rrotate = function(a, n) return toU32(bitlib.rrotate(a, n)) end
+		B.lrotate = function(a, n) return toU32(bitlib.lrotate(a, n)) end
+	else
+		B.band, B.bor, B.bxor = luaBand, luaBor, luaBxor
+		B.bnot = function(a) return 4294967295 - toU32(a) end
+		B.lshift, B.rshift = luaLshift, luaRshift
+		B.rrotate, B.lrotate = luaRrotate, luaLrotate
+	end
+
+	B.arshift = luaArshift
+	B.extract = luaExtract
+	B.replace = luaReplace
+	B.len = function() return 32 end
+	B.countlz = function(x)
+		local u = toU32(x)
+		if u == 0 then return 32 end
+		local n = 0
+		while u < 2147483648 do u = u * 2; n = n + 1 end
+		return n
+	end
+	B.countrz = function(x)
+		local u = toU32(x)
+		if u == 0 then return 32 end
+		local n = 0
+		while u % 2 == 0 do u = u / 2; n = n + 1 end
+		return n
+	end
+	return B, origin
+end
+
+-- shim ставим сразу во все доступные env-таблицы: скрипт запускается из
+-- loadstring и видит глобалы того env, откуда запущен
+local function envTargets()
+	local t = {}
+	local ok, cur = pcall(function() return getfenv(0) end)
+	if ok and type(cur) == "table" then t[#t + 1] = cur end
+	t[#t + 1] = _G
+	t[#t + 1] = genv
+	local sh = rawget(genv, "shared")
+	if type(sh) == "table" then t[#t + 1] = sh end
+	return t
+end
+
+S.shims = {}
+
+local function applyShim(name, value)
+	local targets = envTargets()
+	local done = false
+	for _, t in ipairs(targets) do
+		if pcall(rawset, t, name, value) then done = true end
+	end
+	S.shims[name] = done and "установлен" or "НЕ УСТАНОВЛЕН"
+	return done
+end
+
+local function installShims()
+	-- 1) bit32 (+ countlz/countrz, которых нет даже в bit)
+	local existing = rawget(_G, "bit32")
+	if type(existing) ~= "table" then existing = rawget(genv, "bit32") end
+	local B, origin = makeBit32()
+	if type(existing) == "table" then
+		local added = {}
+		for _, k in ipairs({"band","bor","bxor","bnot","lshift","rshift","arshift",
+			"lrotate","rrotate","extract","replace","len","countlz","countrz"}) do
+			if type(existing[k]) ~= "function" then
+				pcall(rawset, existing, k, B[k])
+				added[#added + 1] = k
+			end
+		end
+		S.shims.bit32 = "дополнен (" .. origin .. "): " .. table.concat(added, ",")
+	else
+		applyShim("bit32", B)
+		S.shims.bit32 = "создан (" .. origin .. ")"
+	end
+	S.log("shim bit32: " .. tostring(S.shims.bit32))
+
+	-- 2) setfenv — настоящей функции нет, эмулируем через слияние env в глобалы
+	if type(rawget(_G, "setfenv")) ~= "function" and type(rawget(genv, "setfenv")) ~= "function" then
+		local setfenvShim = function(f, env)
+			if type(env) == "table" then
+				for k, v in pairs(env) do
+					if rawget(_G, k) == nil then pcall(rawset, _G, k, v) end
+				end
+			end
+			local ok, e = pcall(getfenv, 0)
+			if ok and type(e) == "table" then return e end
+			return env
+		end
+		applyShim("setfenv", setfenvShim)
+		S.log("shim setfenv: создан (эмуляция через слияние env в _G)")
+	else
+		S.shims.setfenv = "уже был"
+	end
+
+	-- 3) unpack -> table.unpack (в Luau глобального unpack нет)
+	if type(rawget(_G, "unpack")) ~= "function" and type(table.unpack) == "function" then
+		applyShim("unpack", table.unpack)
+		S.log("shim unpack: создан (= table.unpack)")
+	else
+		S.shims.unpack = "уже был"
+	end
+
+	-- 4) load -> перехваченный loadstring (иначе VM выполнит payload мимо хука)
+	if type(rawget(_G, "load")) ~= "function" and type(rawget(genv, "load")) ~= "function" then
+		local loadShim = function(chunk, chunkname, ...)
+			local ls = rawget(genv, "loadstring") or rawget(_G, "loadstring")
+			if type(ls) == "function" then return ls(chunk, chunkname, ...) end
+			return nil, "loadstring недоступен"
+		end
+		tagHook(loadShim)
+		applyShim("load", loadShim)
+		S.shims.load = "создан (= перехваченный loadstring)"
+		S.log("shim load: создан, вызовы через него тоже перехватываются")
+	else
+		S.shims.load = "уже был"
+	end
+
+	-- 5) getfenv на всякий случай (Luraph его читает)
+	if type(rawget(_G, "getfenv")) ~= "function" and type(rawget(genv, "getfenv")) ~= "function" then
+		applyShim("getfenv", function(f) return _G end)
+		S.log("shim getfenv: создан")
+	end
+end
+
+---------------------------------------------------------------------------
+-- 12. УСТАНОВКА ВСЕГО
 ---------------------------------------------------------------------------
 local function installAll()
 	hookCount = 0
@@ -988,6 +1235,7 @@ local function installAll()
 	end
 	installEnvHooks()
 	S.scanRemotes()
+	installShims()
 	S.log("всего хуков: " .. tostring(hookCount))
 	return hookCount
 end
@@ -1004,7 +1252,8 @@ local function capReport()
 		"getconstants", "getprotos", "getupvalues", "getconstant", "getupvalue",
 		"getnamecallmethod", "hookmetamethod", "newcclosure", "newproxy",
 		"checkcaller", "checknamecall", "getcallingscript", "getgenv", "getrenv",
-		"setfenv", "getfenv", "debug", "bit32", "bit",
+		"setfenv", "getfenv", "debug", "bit32", "bit", "buffer",
+		"coroutine", "unpack", "select", "os", "io", "buffer",
 	}
 	local out = { "=== CAPABILITIES ===" }
 	for _, n in ipairs(names) do
@@ -1022,6 +1271,16 @@ local function capReport()
 	for _ in pairs(S.remHooked) do classes = classes + 1 end
 	table.insert(out, "remote classes      : " .. tostring(classes))
 	table.insert(out, "remote fire calls   : " .. tostring(S.remoteTotal))
+	table.insert(out, "")
+	table.insert(out, "=== SHIMS (не хватало API для payload) ===")
+	if type(S.shims) == "table" then
+		local names = {}
+		for k in pairs(S.shims) do names[#names + 1] = k end
+		table.sort(names)
+		for _, k in ipairs(names) do
+			table.insert(out, string.format("%-10s %s", k, tostring(S.shims[k])))
+		end
+	end
 	table.insert(out, "session dir         : " .. tostring(S.dir))
 	return table.concat(out, "\n")
 end
@@ -1078,10 +1337,18 @@ _ALL_SOURCE.lua            — все текстовые исходники ск
    автоматически (см. 00_STATUS.txt -> lastECR).
 
 === ЕСЛИ ПАПКА ПУСТАЯ ===
-- Сначала посмотри 00_STATUS.txt: там видно, какие хуки встали.
+- Сначала посмотри 00_STATUS.txt: там видно, какие хуки встали, какие API были
+  nil и какие шимы поставились (секция SHIMS).
 - Если loadstring не перехвачен — запускай ДАМПЕР ПЕРВЫМ, до обфусцированного
   скрипта: Luraph кэширует load() в upvalue на этапе загрузки.
 - Если скрипт грузился до дампера — вызси DUMPER_RETRY(), потом DUMPER_DUMP_FN().
+
+=== ЧАСТАЯ ПРИЧИНА ПУСТОЙ ПАПКИ У LURAPH v15 ===
+Payload вызывает bit32.band/bxor/countrz/... , setfenv, unpack, load.
+Если в эксплоите их нет — VM падает на первой строке (Oq=bit32.band) и
+payload не выполняется вообще. Дампер ставит шимы автоматически (секция SHIMS
+в 00_STATUS.txt). Если там "НЕ УСТАНОВЛЕН" — env read-only, нужен другой
+эксплоит, либо правь окружение руками до запуска payload.
 ]==]
 
 S.save("00_STATUS.txt", capReport() .. "\n\n" .. selfTest() .. "\n\n" .. HINT)
