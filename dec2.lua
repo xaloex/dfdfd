@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    LURAPH v15 DUMPER / UNPACKER  —  v21
+    LURAPH v15 DUMPER / UNPACKER  —  v2
 
     ПОЧЕМУ В ПРЕДЫДУЩЕЙ ВЕРСИИ НИЧЕГО НЕ ДЕКОМПИЛИРОВАЛОСЬ (7 реальных багов):
       1) hookmetamethod(game,"__namecall", newcclosure(function() ... oldNC ... end))
@@ -297,15 +297,33 @@ end
 
 -- Обёртка нативной делается ТОЛЬКО если это безопасно; маркеры нужны, чтобы
 -- повторная установка (DUMPER_RETRY) не оборачивала нашу же обёртку.
+-- ВАЖНО: маркеры вешаем обычным присваиванием, а НЕ через rawset —
+-- rawset/rawget требуют таблицу, а тут функции (иначе ошибка
+-- "invalid argument #1 to 'rawget' (table expected, got function)").
 local function tagHook(fn, base)
-	pcall(function() rawset(fn, "__dumperHook", true) end)
-	pcall(function() rawset(fn, "__dumperBase", base or fn) end)
+	if type(fn) ~= "function" then return fn end
+	pcall(function() fn.__dumperHook = true end)
+	pcall(function() fn.__dumperBase = base or fn end)
 	return fn
 end
 
+local function isOurHook(fn)
+	if type(fn) ~= "function" then return false end
+	local ok, v = pcall(function() return fn.__dumperHook end)
+	return (ok and v == true) or false
+end
+
+local function hookBaseOf(fn)
+	if type(fn) ~= "function" then return nil end
+	local ok, v = pcall(function() return fn.__dumperBase end)
+	if ok and type(v) == "function" then return v end
+	return nil
+end
+
 local function baseOf(prev)
-	if type(prev) == "function" and rawget(prev, "__dumperHook") then
-		local b = rawget(prev, "__dumperBase")
+	if type(prev) ~= "function" then return prev end
+	if isOurHook(prev) then
+		local b = hookBaseOf(prev)
 		if type(b) == "function" then return b end
 	end
 	return prev
@@ -654,7 +672,7 @@ end
 local function install(name, tag)
 	local orig = rawget(genv, name) or rawget(_G, name)
 	if type(orig) ~= "function" then return false, "нет функции" end
-	if rawget(orig, "__dumperHook") then return true, "уже наш хук" end
+	if isOurHook(orig) then return true, "уже наш хук" end
 	local wrapped = buildChunkHook(orig, tag)
 	local ok1 = pcall(function() rawset(genv, name, wrapped) end)
 	local ok2 = pcall(function() rawset(_G, name, wrapped) end)
@@ -789,7 +807,7 @@ end
 local function installRequest(name, holder)
 	local orig = rawget(holder, name)
 	if type(orig) ~= "function" then return false end
-	if rawget(orig, "__dumperHook") then return true end
+	if isOurHook(orig) then return true end
 	local wrapper = function(...)
 		local res = table.pack(orig(...))
 		local opts = select(1, ...)
@@ -822,7 +840,7 @@ function S.patchEnv(env)
 	if type(env) ~= "table" then return end
 	for _, name in ipairs({"loadstring", "load"}) do
 		local cur = rawget(env, name)
-		if type(cur) == "function" and not rawget(cur, "__dumperHook") then
+		if type(cur) == "function" and not isOurHook(cur) then
 			local wrapped = buildChunkHook(cur, name .. "_env")
 			if pcall(rawset, env, name, wrapped) then
 				S.log("env-таблица пропатчена: " .. name)
@@ -833,7 +851,7 @@ end
 
 local function installEnvHooks()
 	local origSet = rawget(genv, "setfenv")
-	if type(origSet) == "function" and not rawget(origSet, "__dumperHook") then
+	if type(origSet) == "function" and not isOurHook(origSet) then
 		local wrapper = function(f, env)
 			if type(env) == "table" then pcall(S.patchEnv, env) end
 			return origSet(f, env)
@@ -846,7 +864,7 @@ local function installEnvHooks()
 	end
 
 	local origGet = rawget(genv, "getfenv")
-	if type(origGet) == "function" and not rawget(origGet, "__dumperHook") then
+	if type(origGet) == "function" and not isOurHook(origGet) then
 		local wrapper = function(f)
 			local env = origGet(f)
 			if type(env) == "table" then pcall(S.patchEnv, env) end
