@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    LURAPH v15 DUMPER / UNPACKER  —  v2
+    LURAPH v15 DUMPER / UNPACKER  —  v21
 
     ПОЧЕМУ В ПРЕДЫДУЩЕЙ ВЕРСИИ НИЧЕГО НЕ ДЕКОМПИЛИРОВАЛОСЬ (7 реальных багов):
       1) hookmetamethod(game,"__namecall", newcclosure(function() ... oldNC ... end))
