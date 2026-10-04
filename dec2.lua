@@ -89,6 +89,7 @@ local S = {
 	urls = {},
 	remoteLog = {},
 	remoteTotal = 0,
+	cap = {},
 	remHooked = {},
 	remBase = {},
 	prev = {},
@@ -284,10 +285,14 @@ local function nativeKeepsUpvalues()
 end
 
 local nativeOk, nativeInfo = nativeKeepsUpvalues()
+S.cap = S.cap or {}
 S.cap.nativeProbe = nativeInfo
-if userCfg.native == true and not nativeOk then
+if not nativeOk then
+	-- проба не прошла -> нативные обёртки гарантированно сломаны (upvalue=nil)
 	S.cfg.native = false
-	S.cap.nativeForced = "cfg.native=true, но " .. tostring(nativeInfo)
+	S.cap.nativeForced = "native выключен автоматически: " .. tostring(nativeInfo)
+elseif userCfg.native == false then
+	S.cap.nativeForced = "native выключен вручную в LURAPH_DUMPER_CFG"
 end
 
 -- Обёртка нативной делается ТОЛЬКО если это безопасно; маркеры нужны, чтобы
