@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    LURAPH v15 DUMPER / UNPACKER  —  v21
+    LURAPH v15 DUMPER / UNPACKER  —  v2
 
     ПОЧЕМУ В ПРЕДЫДУЩЕЙ ВЕРСИИ НИЧЕГО НЕ ДЕКОМПИЛИРОВАЛОСЬ (7 реальных багов):
       1) hookmetamethod(game,"__namecall", newcclosure(function() ... oldNC ... end))
@@ -57,7 +57,7 @@ end
 
 local prevState = stateRef()
 if type(prevState) == "table" and prevState.active then
-	print("[Dumper] Уже запущен. Для переустановки хуков: DUMPER_RETRY()")
+	print("[Dumper] Already running. Use DUMPER_RETRY() to re-hook")
 	return
 end
 
@@ -162,11 +162,11 @@ local ROOT_DIR = "ScriptDumps"
 makeDir(ROOT_DIR)
 S.dir = ROOT_DIR .. "/" .. os.date("%Y-%m-%d_%H-%M-%S")
 makeDir(S.dir)
-S.log("Сессия: workspace/" .. S.dir)
+S.log("Session: workspace/" .. S.dir)
 
 if not S.hasWrite then
-	print("[Dumper] ВНИМАНИЕ: в этом эксплоите нет writefile — сохранять НЕКУДА.")
-	S.log("writefile отсутствует -> дампы не пишутся на диск")
+	print("[Dumper] WARNING: no writefile in this executor - NOWHERE TO SAVE")
+	S.log("writefile missing -> dumps are NOT saved to disk")
 end
 
 ---------------------------------------------------------------------------
@@ -456,7 +456,7 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	local h = hashStr(src)
 	if S.seen[h] then
 		S.dupes = S.dupes + 1
-		S.log(string.format("дубль #%d (%s) пропущен, len=%d", n, tag, #src))
+		S.log(string.format("dup #%d (%s) skipped, len=%d", n, tag, #src))
 		return
 	end
 	S.seen[h] = true
@@ -474,7 +474,7 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	}, "\n")
 
 	if isBinary(src) then
-		S.log(string.format("#%d %s БИНАРНЫЙ chunk (%d байт) -> .chunk.bin", n, tag, #src))
+		S.log(string.format("#%d %s BINARY chunk (%d bytes) -> .chunk.bin", n, tag, #src))
 		S.saveRaw(base .. ".chunk.bin", src)
 		S.save(base .. ".chunk.b64.txt", b64encode(src))
 		S.save(base .. ".chunk.info.txt", string.format(
@@ -487,14 +487,19 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 			S.saveRaw(base .. ".ecr.bin", dec)
 			S.save(base .. ".ecr.b64.txt", b64encode(dec))
 			S.save(base .. ".ecr.lua", "-- ECR auto-decoded: " .. tostring(info) .. "\n" .. dec)
-			S.log("#" .. n .. " ECR расшифрован: " .. tostring(info))
+			S.log("#" .. n .. " ECR decoded: " .. tostring(info))
 		end
 		S.inspectBytecode(base, src, n, tag .. "_chunk")
 	else
 		S.save(base .. ".lua", hdr .. src)
 		table.insert(S.allText, string.format("\n\n-- ==== #%d tag=%s chunk=%s len=%d ====\n%s",
 			n, tag, tostring(chunkname), #src, src))
-		S.log(string.format("#%d %s ТЕКСТ (%d символов) -> %s.lua", n, tag, #src, base))
+		S.log(string.format("#%d %s TEXT (%d chars) -> %s.lua", n, tag, #src, base))
+		-- ищем глобалы, которых нет в окружении -> "attempt to call a nil value"
+		if #src <= 4000000 then
+			local okRep, errRep = pcall(S.reportGlobals, src, n)
+			if not okRep then S.log("reportGlobals error: " .. tostring(errRep)) end
+		end
 		notify("Dumper", string.format("#%d текст %d KB", n, math.floor(#src / 1024)))
 	end
 
@@ -617,7 +622,7 @@ function S.walkFn(fn, base, depth)
 
 	if #lines > 400 then
 		S.save(base .. "_closure_tree.txt", table.concat(lines, "\n"))
-		S.log("closure tree обрезан на " .. #lines .. " строк")
+		S.log("closure tree truncated at " .. #lines .. " lines")
 		-- чистим IN PLACE, иначе родители продолжат писать в отсоединённую таблицу
 		for i = #lines, 1, -1 do lines[i] = nil end
 	end
@@ -682,10 +687,10 @@ local function install(name, tag)
 	end
 	if ok1 or ok2 then
 		hookCount = hookCount + 1
-		S.log(string.format("хук %s установлен (native=%s)", name, tostring(S.cfg.native)))
+		S.log(string.format("hook %s installed (native=%s)", name, tostring(S.cfg.native)))
 		return true, "ok"
 	end
-	S.log("хук " .. name .. " НЕ установлен (read-only)")
+	S.log("hook " .. name .. " NOT installed (read-only)")
 	return false, "read-only"
 end
 
@@ -705,18 +710,18 @@ function S.saveHttp(url, body, method)
 	S.save(base .. ".body", "-- URL: " .. tostring(url) .. "\n-- via: " .. tostring(method)
 		.. "\n-- Size: " .. #body .. "\n\n" .. body)
 	S.save(base .. ".url.txt", tostring(url))
-	S.log(string.format("HTTP #%d %s %s (%d байт)", n, tostring(method), tostring(url), #body))
+	S.log(string.format("HTTP #%d %s %s (%d bytes)", n, tostring(method), tostring(url), #body))
 	notify("Dumper", "HTTP #" .. n .. " " .. tostring(method) .. " " .. tostring(url):sub(1, 34))
 end
 
 local function patchHttpService()
 	if type(hookmetamethod) ~= "function" then
-		S.log("hookmetamethod нет -> HTTP не перехватывается")
+		S.log("no hookmetamethod -> HTTP not hooked")
 		return false
 	end
 	local okSvc, svc = pcall(function() return game:GetService("HttpService") end)
 	if not okSvc or type(svc) ~= "instance" then
-		S.log("HttpService не получен")
+		S.log("HttpService unavailable")
 		return false
 	end
 
@@ -744,17 +749,17 @@ local function patchHttpService()
 		local base = baseOf(prev)
 		if type(base) == "function" then S.prev.httpNC = base end
 		tagHook(native, S.prev.httpNC)
-		S.log("хук HttpService:RequestAsync/GetAsync установлен")
+		S.log("hook HttpService:RequestAsync/GetAsync installed")
 		hookCount = hookCount + 1
 		return true
 	end
-	S.log("хук HttpService НЕ установлен: " .. tostring(prev))
+	S.log("hook HttpService NOT installed: " .. tostring(prev))
 	return false
 end
 
 local function patchGame()
 	if type(hookmetamethod) ~= "function" then
-		S.log("hookmetamethod нет -> game:* не перехватывается")
+		S.log("no hookmetamethod -> game:* not hooked")
 		return false
 	end
 	local namecall = function(self, ...)
@@ -777,11 +782,11 @@ local function patchGame()
 		local base = baseOf(prev)
 		if type(base) == "function" then S.prev.gameNC = base end
 		tagHook(native, S.prev.gameNC)
-		S.log("хук game:HttpGet*/HttpPost* установлен")
+		S.log("hook game:HttpGet*/HttpPost* installed")
 		hookCount = hookCount + 1
 		return true
 	end
-	S.log("хук game НЕ установлен: " .. tostring(prev))
+	S.log("hook game NOT installed: " .. tostring(prev))
 	return false
 end
 
@@ -827,7 +832,7 @@ local function installRequest(name, holder)
 	tagHook(wrapper, orig)
 	local ok = pcall(function() rawset(holder, name, makeNative(wrapper)) end)
 	if ok then
-		S.log("хук " .. name .. " установлен")
+		S.log("hook " .. name .. " installed")
 		hookCount = hookCount + 1
 	end
 	return ok
@@ -843,7 +848,7 @@ function S.patchEnv(env)
 		if type(cur) == "function" and not isOurHook(cur) then
 			local wrapped = buildChunkHook(cur, name .. "_env")
 			if pcall(rawset, env, name, wrapped) then
-				S.log("env-таблица пропатчена: " .. name)
+				S.log("env table patched: " .. name)
 			end
 		end
 	end
@@ -858,7 +863,7 @@ local function installEnvHooks()
 		end
 		tagHook(wrapper, origSet)
 		if pcall(function() rawset(genv, "setfenv", makeNative(wrapper)) end) then
-			S.log("хук setfenv установлен")
+			S.log("hook setfenv installed")
 			hookCount = hookCount + 1
 		end
 	end
@@ -872,7 +877,7 @@ local function installEnvHooks()
 		end
 		tagHook(wrapper, origGet)
 		if pcall(function() rawset(genv, "getfenv", makeNative(wrapper)) end) then
-			S.log("хук getfenv установлен")
+			S.log("hook getfenv installed")
 			hookCount = hookCount + 1
 		end
 	end
@@ -959,7 +964,7 @@ function S.scanRemotes()
 			end
 		end
 	end
-	S.log("remote-классов с хуком: " .. tostring(n))
+	S.log("remote classes hooked: " .. tostring(n))
 
 	if not S.descConn then
 		pcall(function()
@@ -1182,7 +1187,7 @@ local function installShims()
 			return env
 		end
 		applyShim("setfenv", setfenvShim)
-		S.log("shim setfenv: создан (эмуляция через слияние env в _G)")
+		S.log("shim setfenv: created (env merged into _G)")
 	else
 		S.shims.setfenv = "уже был"
 	end
@@ -1190,7 +1195,7 @@ local function installShims()
 	-- 3) unpack -> table.unpack (в Luau глобального unpack нет)
 	if type(rawget(_G, "unpack")) ~= "function" and type(table.unpack) == "function" then
 		applyShim("unpack", table.unpack)
-		S.log("shim unpack: создан (= table.unpack)")
+		S.log("shim unpack: created (= table.unpack)")
 	else
 		S.shims.unpack = "уже был"
 	end
@@ -1205,7 +1210,7 @@ local function installShims()
 		tagHook(loadShim)
 		applyShim("load", loadShim)
 		S.shims.load = "создан (= перехваченный loadstring)"
-		S.log("shim load: создан, вызовы через него тоже перехватываются")
+		S.log("shim load: created, calls through it are hooked too")
 	else
 		S.shims.load = "уже был"
 	end
@@ -1213,13 +1218,257 @@ local function installShims()
 	-- 5) getfenv на всякий случай (Luraph его читает)
 	if type(rawget(_G, "getfenv")) ~= "function" and type(rawget(genv, "getfenv")) ~= "function" then
 		applyShim("getfenv", function(f) return _G end)
-		S.log("shim getfenv: создан")
+		S.log("shim getfenv: created")
 	end
 end
 
 ---------------------------------------------------------------------------
--- 12. УСТАНОВКА ВСЕГО
+-- 11.7 СТАТИЧЕСКИЙ АНАЛИЗ ГЛОБАЛОВ
+-- "attempt to call a nil value" = payload вызывает глобал, которого нет в
+-- окружении. Разбираем исходник на токены и выписываем в MISSING_GLOBALS.txt
+-- именно те имена, которых реально нет в env.
 ---------------------------------------------------------------------------
+local LUA_KEYWORDS = {
+	["and"]=true, ["break"]=true, ["do"]=true, ["else"]=true, ["elseif"]=true,
+	["end"]=true, ["false"]=true, ["for"]=true, ["function"]=true, ["if"]=true,
+	["in"]=true, ["local"]=true, ["nil"]=true, ["not"]=true, ["or"]=true,
+	["repeat"]=true, ["return"]=true, ["then"]=true, ["true"]=true,
+	["until"]=true, ["while"]=true, ["continue"]=true, ["export"]=true,
+	["goto"]=true,
+}
+
+local KNOWN_GLOBALS = {
+	-- Luau / Lua
+	["_G"]=true, ["_VERSION"]=true, ["assert"]=true, ["error"]=true,
+	["getmetatable"]=true, ["setmetatable"]=true, ["rawequal"]=true,
+	["rawget"]=true, ["rawlen"]=true, ["rawset"]=true, ["select"]=true,
+	["tonumber"]=true, ["tostring"]=true, ["type"]=true, ["typeof"]=true,
+	["unpack"]=true, ["print"]=true, ["warn"]=true, ["pcall"]=true,
+	["xpcall"]=true, ["newproxy"]=true, ["loadstring"]=true, ["load"]=true,
+	["require"]=true, ["coroutine"]=true, ["debug"]=true, ["math"]=true,
+	["os"]=true, ["io"]=true, ["string"]=true, ["table"]=true,
+	["bit"]=true, ["bit32"]=true, ["utf8"]=true, ["buffer"]=true,
+	["task"]=true, ["gcinfo"]=true, ["collectgarbage"]=true, ["tick"]=true,
+	["time"]=true, ["delay"]=true, ["spawn"]=true, ["wait"]=true,
+	["DateTime"]=true, ["Random"]=true, ["Region3"]=true, ["UDim"]=true, ["UDim2"]=true,
+	["Vector2"]=true, ["Vector3"]=true, ["CFrame"]=true, ["Color3"]=true,
+	["BrickColor"]=true, ["Instance"]=true, ["Enum"]=true, ["Ray"]=true, ["Rect"]=true,
+	["Faces"]=true, ["Axes"]=true, ["PhysicalProperties"]=true,
+	["Workspace"]=true, ["Lighting"]=true, ["ReplicatedStorage"]=true,
+	["ServerStorage"]=true, ["ServerScriptService"]=true, ["Players"]=true,
+	["StarterGui"]=true, ["StarterPack"]=true, ["StarterPlayer"]=true,
+	["SoundService"]=true, ["Teams"]=true, ["UserInputService"]=true,
+	["RunService"]=true, ["TweenService"]=true, ["ContextActionService"]=true,
+	["HttpService"]=true, ["InsertService"]=true, ["GuiService"]=true,
+	["MarketplaceService"]=true, ["TeleportService"]=true, ["TextService"]=true,
+	["PathfindingService"]=true, ["PhysicsService"]=true, ["CollectionService"]=true,
+	["DataStoreService"]=true, ["MessagingService"]=true, ["LocalizationService"]=true,
+	["PolicyService"]=true, ["Sound"]=true, ["NumberSequence"]=true,
+	["NumberRange"]=true, ["NumberSequenceKeypoint"]=true, ["Font"]=true,
+	["Frame"]=true, ["GuiObject"]=true, ["TextLabel"]=true, ["TextButton"]=true,
+	["TextBox"]=true, ["ImageLabel"]=true, ["ScrollingFrame"]=true, ["UIGesture"]=true,
+	["UIListLayout"]=true, ["UIPadding"]=true, ["UISizeConstraint"]=true,
+	["UITextSizeConstraint"]=true, ["UIStroke"]=true, ["UIGradient"]=true,
+	["UIAspectRatioConstraint"]=true, ["UICorner"]=true, ["UIPositionConstraint"]=true,
+	["Part"]=true, ["WedgePart"]=true, ["MeshPart"]=true, ["TrussPart"]=true,
+	["SpawnLocation"]=true, ["Seat"]=true, ["SeatWeld"]=true, ["Weld"]=true,
+	["Motor6D"]=true, ["BodyVelocity"]=true, ["BodyAngularVelocity"]=true,
+	["BodyPosition"]=true, ["BodyGyro"]=true, ["AlignPosition"]=true,
+	["AlignOrientation"]=true, ["Humanoid"]=true, ["HumanoidStateChange"]=true,
+	["Animation"]=true, ["AnimationController"]=true, ["Tool"]=true,
+	["ClickDetector"]=true, ["ProximityPrompt"]=true, ["RemoteEvent"]=true,
+	["RemoteFunction"]=true, ["UnreliableRemoteEvent"]=true, ["BindableEvent"]=true,
+	["BindableFunction"]=true, ["PlayerGui"]=true, ["Backpack"]=true,
+	["PlayerScripts"]=true, ["PlayerMouse"]=true, ["ContextAction"]=true,
+	["LevelOfDetail"]=true, ["NumberPose"]=true, ["Random"]=true,
+	-- эксплоиты
+	["getgenv"]=true, ["getrenv"]=true, ["getcallingscript"]=true,
+	["hookfunction"]=true, ["hookmetamethod"]=true, ["newcclosure"]=true,
+	["checkcaller"]=true, ["checknamecall"]=true, ["getnamecallmethod"]=true,
+	["setfenv"]=true, ["getfenv"]=true, ["getconstants"]=true, ["getprotos"]=true,
+	["getupvalues"]=true, ["getconstant"]=true, ["getupvalue"]=true,
+	["getproto"]=true, ["getconstant2"]=true, ["setupvalue"]=true,
+	["setconstant"]=true, ["setreadonly"]=true, ["isreadonly"]=true,
+	["queue_on_teleport"]=true, ["queueonteleport"]=true,
+	["writefile"]=true, ["readfile"]=true, ["appendfile"]=true,
+	["makefolder"]=true, ["isfolder"]=true, ["listfiles"]=true,
+	["delfile"]=true, ["delfolder"]=true, ["isfile"]=true,
+	["request"]=true, ["http_request"]=true, ["httpRequest"]=true,
+	["syn"]=true, ["shared"]=true, ["identifyexecutor"]=true,
+	["getexecutorname"]=true, ["getexecutor"]=true, ["isexecutor"]=true,
+	["gethud"]=true, ["gethui"]=true, ["getregistry"]=true, ["getgc"]=true,
+	["collectgarbage0"]=true, ["signal"]=true, ["Synapse"]=true, ["Fluxus"]=true,
+	["Krnl"]=true, ["Solara"]=true, ["Delta"]=true, ["Luraph"]=true,
+	["ScriptDumper"]=true, ["Executor"]=true, ["COMMAND_ID"]=true,
+	["getcustomattribute"]=true, ["setcustomattribute"]=true,
+	["setscriptable"]=true, ["getscriptable"]=true, ["clone"]=true,
+}
+
+local SCAN_LIMIT = 700000
+
+local function scanNames(src)
+	local seen, order = {}, {}
+	local n = #src
+	if n > SCAN_LIMIT then n = SCAN_LIMIT end
+	local i = 1
+	while i <= n do
+		local c = src:sub(i, i)
+		if c == "-" and src:sub(i, i + 1) == "-" then
+			local lb = src:match("^%-%-%[(=*)%[", i)
+			if lb then
+				local close = "]" .. lb .. "]"
+				local e = src:find(close, i, true)
+				i = (e and e + #close) or (n + 1)
+			else
+				local e = src:find("\n", i, true)
+				i = (e and e + 1) or (n + 1)
+			end
+		elseif c == "[" and src:match("^%[(=*)%[", i) then
+			local lb = src:match("^%[(=*)%[", i)
+			local close = "]" .. lb .. "]"
+			local e = src:find(close, i, true)
+			i = (e and e + #close) or (n + 1)
+		elseif c == '"' or c == "'" then
+			local quote = c
+			local j = i + 1
+			while j <= n do
+				local ch = src:sub(j, j)
+				if ch == "\\" then j = j + 2
+				elseif ch == quote then j = j + 1 break
+				elseif ch == "\n" then break
+				else j = j + 1 end
+			end
+			i = j
+		elseif c:match("[%a_]") then
+			local j = i
+			while j <= n and src:sub(j, j):match("[%w_]") do j = j + 1 end
+			local name = src:sub(i, j - 1)
+			-- member-access (table.concat, obj:Method) — это НЕ глобал
+			local p = i - 1
+			while p >= 1 and src:sub(p, p):match("%s") do p = p - 1 end
+			local isMember = p >= 1 and (src:sub(p, p) == "." or src:sub(p, p) == ":")
+			if not isMember and not LUA_KEYWORDS[name] and not KNOWN_GLOBALS[name]
+				and not seen[name] then
+				seen[name] = true
+				order[#order + 1] = name
+			end
+			i = j
+		else
+			i = i + 1
+		end
+	end
+	return order
+end
+
+-- имена, объявленные самим исходником (local/function/параметры) — отбрасываем
+local function declaredNames(src)
+	local out = {}
+	local n = #src
+	if n > SCAN_LIMIT then n = SCAN_LIMIT end
+	local head = src:sub(1, n)
+	for m in head:gmatch("local%s+([%a_][%w_]*)") do out[m] = true end
+	for m in head:gmatch("local%s+[%a_][%w_]*%s*,%s*([%a_][%w_]*)") do out[m] = true end
+	for m in head:gmatch("local%s+[%a_][%w_]*%s*,%s*[%a_][%w_]*%s*,%s*([%a_][%w_]*)") do out[m] = true end
+	for m in head:gmatch("function%s+([%a_][%w_]*)") do out[m] = true end
+	-- параметры: function name(a, b) и function(a, b)
+	for m in head:gmatch("function%s+[%a_][%w_]*%s*%(([^%)]*)%)") do
+		for p in m:gmatch("[%a_][%w_]*") do out[p] = true end
+	end
+	for m in head:gmatch("function%s*%(([^%)]*)%)") do
+		for p in m:gmatch("[%a_][%w_]*") do out[p] = true end
+	end
+	-- for k, v in ... (gmatch отдаёт только ПЕРВЫЙ захват в переменную цикла,
+	-- поэтому второе имя обязано идти в отдельную переменную)
+	for k, v in head:gmatch("for%s+([%a_][%w_]*)%s*,%s*([%a_][%w_]*)%s+in") do
+		if k then out[k] = true end
+		if v then out[v] = true end
+	end
+	return out
+end
+
+function S.reportGlobals(src, id)
+	local used = scanNames(src)
+	local declared = declaredNames(src)
+	local missing = {}
+	for _, name in ipairs(used) do
+		if not declared[name] then
+			local v = rawget(genv, name)
+			if v == nil then v = rawget(_G, name) end
+			if v == nil then missing[#missing + 1] = name end
+		end
+	end
+	if #missing > 0 then
+		S.missingBuf = S.missingBuf or {}
+		table.insert(S.missingBuf, string.format(
+			"=== chunk #%d (%d символов): глобалы, которых НЕТ в окружении (%d) ===\n  %s",
+			id, #src, #missing, table.concat(missing, ", ")))
+		S.save("MISSING_GLOBALS.txt", table.concat(S.missingBuf, "\n\n") .. "\n")
+		S.log("MISSING globals chunk #" .. id .. " (" .. #missing .. "): " .. table.concat(missing, ", "))
+	end
+	return missing
+end
+
+-- персистентный proxy: любое обращение к полю даёт вызываемую заглушку
+local function makeProxy(name)
+	local proxy
+	proxy = setmetatable({}, {
+		__index = function(_, k)
+			local fn = function() return proxy end
+			rawset(proxy, k, fn)
+			return fn
+		end,
+		__call = function() return proxy end,
+		__tostring = function() return "[proxy " .. tostring(name) .. "]" end,
+	})
+	return proxy
+end
+
+local function installExtraShims()
+	if type(rawget(_G, "newproxy")) ~= "function" and type(rawget(genv, "newproxy")) ~= "function" then
+		applyShim("newproxy", function(addMt)
+			local t = {}
+			if addMt then setmetatable(t, {}) end
+			return t
+		end)
+		S.shims.newproxy = "создан (таблица вместо proxy userdata)"
+	end
+
+	-- require: чтобы не было "attempt to call a nil value"
+	if type(rawget(_G, "require")) ~= "function" and type(rawget(genv, "require")) ~= "function" then
+		local reqShim = function(mod)
+			if type(mod) == "number" then return nil, "require(" .. tostring(mod) .. ") недоступен" end
+			return makeProxy("require:" .. tostring(mod))
+		end
+		applyShim("require", reqShim)
+		S.shims.require = "создан (персистентный proxy)"
+	end
+
+	-- определение эксплоита — многие payload'ы зовут это первым делом
+	if type(rawget(_G, "identifyexecutor")) ~= "function" then
+		applyShim("identifyexecutor", function() return "Dumper" end)
+		S.shims.identifyexecutor = "создан (возвращает Dumper)"
+	end
+	if type(rawget(_G, "getexecutorname")) ~= "function" then
+		applyShim("getexecutorname", function() return "Dumper" end)
+		S.shims.getexecutorname = "создан (возвращает Dumper)"
+	end
+
+	if type(rawget(_G, "hookfunction")) ~= "function" then
+		applyShim("hookfunction", function(target, repl)
+			-- target может быть чем угодно; rawset требует таблицу
+			if type(target) == "table" and type(repl) == "function" then
+				pcall(rawset, target, "__dumperHook", true)
+			end
+			return function(...) end
+		end)
+		S.shims.hookfunction = "создан (no-op)"
+	end
+	if type(rawget(_G, "getgc")) ~= "function" then
+		applyShim("getgc", function() return {} end)
+		S.shims.getgc = "создан (пустой)"
+	end
+end
+
 local function installAll()
 	hookCount = 0
 	install("loadstring", "loadstring")
@@ -1236,7 +1485,8 @@ local function installAll()
 	installEnvHooks()
 	S.scanRemotes()
 	installShims()
-	S.log("всего хуков: " .. tostring(hookCount))
+	installExtraShims()
+	S.log("hooks total: " .. tostring(hookCount))
 	return hookCount
 end
 
@@ -1254,6 +1504,7 @@ local function capReport()
 		"checkcaller", "checknamecall", "getcallingscript", "getgenv", "getrenv",
 		"setfenv", "getfenv", "debug", "bit32", "bit", "buffer",
 		"coroutine", "unpack", "select", "os", "io", "buffer",
+		"require", "hookfunction", "getgc", "identifyexecutor", "getexecutorname",
 	}
 	local out = { "=== CAPABILITIES ===" }
 	for _, n in ipairs(names) do
@@ -1325,6 +1576,7 @@ scripts/NNN_*.ecr.lua      — авто-расшифрованный ECR-кон�
 luraph_strings.txt         — все строки из getconstants/getupvalues
 luraph_urls.txt            — найденные URL / webhook / pastebin
 remotes_log.txt            — все FireServer/InvokeServer с аргументами
+MISSING_GLOBALS.txt        — глобалы из исходников, которых НЕТ в окружении
 http/                      — всё, что скачали по сети
 _ALL_SOURCE.lua            — все текстовые исходники склеены
 
@@ -1349,6 +1601,11 @@ Payload вызывает bit32.band/bxor/countrz/... , setfenv, unpack, load.
 payload не выполняется вообще. Дампер ставит шимы автоматически (секция SHIMS
 в 00_STATUS.txt). Если там "НЕ УСТАНОВЛЕН" — env read-only, нужен другой
 эксплоит, либо правь окружение руками до запуска payload.
+
+Если появилась ошибка "attempt to call a nil value" — открой
+MISSING_GLOBALS.txt: там список имён, которые payload использует как
+глобалы, а в окружении их нет. Добавь нужные шимы в секцию 11.7/11.8
+или проверь эксплоит.
 ]==]
 
 S.save("00_STATUS.txt", capReport() .. "\n\n" .. selfTest() .. "\n\n" .. HINT)
@@ -1380,17 +1637,17 @@ genv.DUMPER_RETRY = function()
 	S.walkVisited = nil
 	installAll()
 	S.save("00_STATUS.txt", capReport() .. "\n\n" .. selfTest() .. "\n")
-	print("[Dumper] Повторная установка хуков: " .. genv.DUMPER_STATUS())
+	print("[Dumper] Re-hook done: " .. genv.DUMPER_STATUS())
 	return hookCount
 end
 
 S.flushRecon(true)
 
 print("======================================================")
-print("  LURAPH v15 DUMPER v2 — ЗАПУЩЕН")
-print("  папка: workspace/" .. tostring(S.dir))
-print("  хуков: " .. tostring(hookCount) .. "   writefile: " .. tostring(S.hasWrite))
+print("  LURAPH v15 DUMPER v2 - RUNNING")
+print("  folder: workspace/" .. tostring(S.dir))
+print("  hooks: " .. tostring(hookCount) .. "   writefile: " .. tostring(S.hasWrite))
 print("  newcclosure: " .. tostring(S.cfg.native) .. " (" .. tostring(S.cap.nativeProbe) .. ")")
-print("  теперь запускай свой обфусцированный скрипт")
+print("  now run your obfuscated script")
 print("======================================================")
 notify("Luraph Dumper v2", "Готов! Папка: " .. tostring(S.dir))
