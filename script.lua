@@ -1,4 +1,4 @@
--- [[ VANTA JNKIE & HTTP Sniffer + Key Response Interceptor ]] --
+-- [[ VANTA JNKIE Auto-Injector & HTTP Sniffer ]] --
 local os_date = os.date("%Y-%m-%d_%H-%M-%S")
 local base_folder = "shlushatel"
 local session_folder = base_folder .. "/" .. os_date
@@ -43,12 +43,15 @@ local function dumpScript(code, source_info)
     return dump_filename
 end
 
-writeLog("=== JNKIE DECODER & HTTP SNIFFER STARTED ===")
+writeLog("=== JNKIE AUTO-INJECTOR & SNIFFER STARTED ===")
 writeLog("Session directory: " .. session_folder)
 
--- Check if SCRIPT_KEY is set, if not warn dj
-if type(getgenv().SCRIPT_KEY) ~= "string" and type(SCRIPT_KEY) ~= "string" then
-    writeLog("[WARNING] SCRIPT_KEY is not set in getgenv()!\nSet 'getgenv().SCRIPT_KEY = \"YOUR_KEY\"' before running the loader.")
+-- AUTO-SET DUMMY KEY IF MISSING SO LOADER DOES NOT EARLY EXIT
+if type(getgenv().SCRIPT_KEY) ~= "string" or getgenv().SCRIPT_KEY == "" then
+    getgenv().SCRIPT_KEY = "DUMMY_SNIFFER_KEY_123"
+    writeLog("[AUTO-FIX] SCRIPT_KEY was empty! Automatically set getgenv().SCRIPT_KEY = 'DUMMY_SNIFFER_KEY_123' to force HTTP request execution.")
+else
+    writeLog("Using existing SCRIPT_KEY: " .. tostring(getgenv().SCRIPT_KEY))
 end
 
 --------------------------------------------------------------------------------
@@ -83,7 +86,7 @@ for _, item in ipairs(request_targets) do
                 end
                 
                 writeLog(string.format(
-                    "[HTTP REQUEST SENT via %s]\nMethod: %s\nURL: %s\nHeaders:%s\nBody / Key Sent:\n%s",
+                    "[HTTP REQUEST OUTGOING (%s)]\nMethod: %s\nURL: %s\nHeaders:%s\nBody (Key/Payload):\n%s",
                     item.name, method, url, (headers ~= "" and headers or " None"), (body ~= "" and body or "<empty>")
                 ))
                 
@@ -96,9 +99,8 @@ for _, item in ipairs(request_targets) do
                     local dumped_file = dumpScript(resp_body, "HTTP Response from " .. url .. " (Status: " .. status .. ")")
                     
                     writeLog(string.format(
-                        "[HTTP RESPONSE RECEIVED via %s]\nURL: %s\nStatus Code: %s\nSaved Payload to: %s\nResponse Body Preview:\n%s",
-                        item.name, url, status, dumped_file,
-                        (#resp_body > 400 and resp_body:sub(1, 400) .. "..." or resp_body)
+                        "[HTTP RESPONSE INCOMING (%s)]\nURL: %s\nStatus: %s\nSaved Payload to: %s\nResponse Body:\n%s",
+                        item.name, url, status, dumped_file, resp_body
                     ))
                 end
                 
@@ -107,7 +109,7 @@ for _, item in ipairs(request_targets) do
             return original(options)
         end)
         hooked_fns[item.fn] = true
-        writeLog("Hooked request function: " .. item.name)
+        writeLog("Hooked function: " .. item.name)
     end
 end
 
@@ -118,7 +120,7 @@ if hookfunction then
     pcall(function()
         local orig_httpget
         orig_httpget = hookfunction(game.HttpGet, function(self, url, ...)
-            writeLog(string.format("[game.HttpGet]\nURL: %s", tostring(url)))
+            writeLog(string.format("[game.HttpGet Call]\nURL: %s", tostring(url)))
             local res = orig_httpget(self, url, ...)
             if type(res) == "string" and #res > 0 then
                 local dumped = dumpScript(res, "game.HttpGet: " .. tostring(url))
@@ -139,7 +141,7 @@ if hookfunction and type(loadstring) == "function" then
         local dumped_file = dumpScript(code, source_info)
         
         writeLog(string.format(
-            "[LOADSTRING EXECUTED]\nChunk: %s\nLength: %d bytes\nSaved script code to: %s\nPreview:\n%s",
+            "[LOADSTRING INTERCEPTED]\nChunk: %s\nLength: %d bytes\nSaved code to: %s\nPreview:\n%s",
             tostring(source_info), #tostring(code), dumped_file, tostring(code):sub(1, 300)
         ))
         
@@ -147,4 +149,4 @@ if hookfunction and type(loadstring) == "function" then
     end)
 end
 
-writeLog("Sniffer ready. Now run your loader script.")
+writeLog("Hooks ready. Run your JNKIE loader now.")
