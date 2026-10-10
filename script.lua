@@ -1,12 +1,8 @@
--- [[ VANTA JNKIE Interceptor & Response Spoofer ]] --
+-- [[ VANTA Deep Environment & Runtime Tracer ]] --
 local os_date = os.date("%Y-%m-%d_%H-%M-%S")
 local base_folder = "shlushatel"
 local session_folder = base_folder .. "/" .. os_date
-local log_path = session_folder .. "/log.txt"
-
--- НАСТРОЙКИ ЭМУЛЯЦИИ / ПОДМЕНЫ
-getgenv().SPOOF_JNKIE_KEY = false -- Поставь true, если хочешь вернуть фейковый 200 OK
-getgenv().SPOOF_SCRIPT_URL = "https://raw.githubusercontent.com/site/main/script.lua" -- Ссылка на замену (если нужно)
+local log_path = session_folder .. "/deep_trace.txt"
 
 local function safeMakeFolder(path)
     if isfolder and not isfolder(path) then
@@ -18,8 +14,6 @@ end
 
 safeMakeFolder(base_folder)
 safeMakeFolder(session_folder)
-
-local dump_count = 0
 
 local function writeLog(text)
     local timestamp = os.date("[%Y-%m-%d %H:%M:%S] ")
@@ -35,85 +29,118 @@ local function writeLog(text)
         pcall(writefile, log_path, entry)
     end
     
-    print("[SNIFFER] " .. text)
+    print("[TRACER] " .. text)
 end
 
-local function dumpScript(code, source_info)
-    dump_count = dump_count + 1
-    local dump_filename = string.format("%s/dump_%d.lua", session_folder, dump_count)
-    if writefile then
-        pcall(writefile, dump_filename, "-- Source: " .. tostring(source_info) .. "\n\n" .. tostring(code))
-    end
-    return dump_filename
-end
-
-writeLog("=== JNKIE SPOOFER & SNIFFER STARTED ===")
+writeLog("=== DEEP TRACER & RUNTIME PROBER STARTED ===")
 writeLog("Session directory: " .. session_folder)
 
-if type(getgenv().SCRIPT_KEY) ~= "string" or getgenv().SCRIPT_KEY == "" then
-    getgenv().SCRIPT_KEY = "DUMMY_SNIFFER_KEY"
+--------------------------------------------------------------------------------
+-- 1. TRACE STRING OPERATIONS (To catch obfuscated strings & hidden URLs)
+--------------------------------------------------------------------------------
+if hookfunction then
+    pcall(function()
+        local orig_sub = hookfunction(string.sub, function(s, i, j)
+            local str = tostring(s)
+            if #str > 15 and (str:find("http") or str:find("jnkie") or str:find("api") or str:find("key") or str:find("LDR")) then
+                writeLog(string.format("[STRING.SUB TRACE]\nInput: %s\nRange: %s to %s", str, tostring(i), tostring(j)))
+            end
+            return orig_sub(s, i, j)
+        end)
+    end)
+    
+    pcall(function()
+        local orig_match = hookfunction(string.match, function(s, pattern)
+            local str = tostring(s)
+            if str:find("http") or str:find("LDR") or str:find("jnkie") then
+                writeLog(string.format("[STRING.MATCH TRACE]\nTarget: %s\nPattern: %s", str, tostring(pattern)))
+            end
+            return orig_match(s, pattern)
+        end)
+    end)
 end
 
 --------------------------------------------------------------------------------
--- 1. HOOK REQUEST & RESPONSE SPOOFING
+-- 2. TRACE ALL ENVIRONMENT ACCESS (getgenv / getrenv / getfenv)
 --------------------------------------------------------------------------------
-local request_targets = {
+local env = getgenv and getgenv() or _G
+setmetatable(env, {
+    __index = function(t, k)
+        writeLog("[ENV READ] Global accessed: " .. tostring(k))
+        return rawget(t, k)
+    end,
+    __newindex = function(t, k, v)
+        writeLog(string.format("[ENV WRITE] Global set: %s = %s", tostring(k), tostring(v)))
+        rawset(t, k, v)
+    end
+})
+
+--------------------------------------------------------------------------------
+-- 3. TRACE NETWORK REQUESTS & RESPONSES
+--------------------------------------------------------------------------------
+local req_fns = {
     {name = "request", fn = request},
     {name = "http_request", fn = http_request},
     {name = "syn.request", fn = syn and syn.request},
     {name = "http.request", fn = http and http.request},
 }
 
-for _, item in ipairs(request_targets) do
+for _, item in ipairs(req_fns) do
     if item.fn and type(item.fn) == "function" and hookfunction then
-        local original
-        original = hookfunction(item.fn, function(options)
+        local old_fn
+        old_fn = hookfunction(item.fn, function(options)
             if type(options) == "table" then
                 local url = tostring(options.Url or options.url or "N/A")
                 local method = tostring(options.Method or options.method or "GET")
                 local body = tostring(options.Body or options.body or "")
+                local headers_str = ""
                 
-                writeLog(string.format("[OUTGOING REQUEST (%s)]\nMethod: %s\nURL: %s\nBody: %s", item.name, method, url, body))
-                
-                -- Если включен споофинг и это запрос проверки ключа JNKIE
-                if getgenv().SPOOF_JNKIE_KEY and url:find("jnkie.com/api/v1/luascripts/delivery") then
-                    writeLog("[SPOOFER INTERCEPTED] Returning fake 200 OK with payload URL...")
-                    return {
-                        StatusCode = 200,
-                        StatusDescription = "OK",
-                        Headers = {["Content-Type"] = "text/plain"},
-                        Body = getgenv().SPOOF_SCRIPT_URL
-                    }
+                local h = options.Headers or options.headers
+                if type(h) == "table" then
+                    for k, v in pairs(h) do
+                        headers_str = headers_str .. "\n  " .. tostring(k) .. ": " .. tostring(v)
+                    end
                 end
                 
-                local response = original(options)
+                writeLog(string.format(
+                    "[NETWORK REQUEST via %s]\nMethod: %s\nURL: %s\nHeaders:%s\nBody:\n%s",
+                    item.name, method, url, (headers_str ~= "" and headers_str or " None"), body
+                ))
                 
-                if type(response) == "table" then
-                    local status = tostring(response.StatusCode or "200")
-                    local resp_body = tostring(response.Body or "")
+                local res = old_fn(options)
+                
+                if type(res) == "table" then
+                    local status = tostring(res.StatusCode or "N/A")
+                    local res_body = tostring(res.Body or "")
                     
-                    local dumped_file = dumpScript(resp_body, "HTTP Response from " .. url)
-                    writeLog(string.format("[INCOMING RESPONSE (%s)]\nURL: %s\nStatus: %s\nDumped: %s\nBody:\n%s", 
-                        item.name, url, status, dumped_file, resp_body:sub(1, 300)))
+                    writeLog(string.format(
+                        "[NETWORK RESPONSE via %s]\nURL: %s\nStatus: %s\nLength: %d bytes\nBody:\n%s",
+                        item.name, url, status, #res_body, res_body
+                    ))
                 end
                 
-                return response
+                return res
             end
-            return original(options)
+            return old_fn(options)
         end)
+        writeLog("Hooked network function: " .. item.name)
     end
 end
 
 --------------------------------------------------------------------------------
--- 2. HOOK LOADSTRING
+-- 4. TRACE LOADSTRING & DUMP ALL EXECUTED CODE
 --------------------------------------------------------------------------------
 if hookfunction and type(loadstring) == "function" then
     local old_loadstring
     old_loadstring = hookfunction(loadstring, function(code, chunkname)
-        local dumped_file = dumpScript(code, chunkname or "loadstring")
-        writeLog(string.format("[LOADSTRING DUMPED]\nLength: %d bytes\nFile: %s", #tostring(code), dumped_file))
+        local c = tostring(code)
+        writeLog(string.format(
+            "[LOADSTRING INTERCEPTED]\nChunk: %s\nLength: %d bytes\nCode:\n%s",
+            tostring(chunkname or "N/A"), #c, c
+        ))
         return old_loadstring(code, chunkname)
     end)
+    writeLog("Hooked loadstring for full code tracing.")
 end
 
-writeLog("Hooks deployed.")
+writeLog("Deep Tracer active. Run your loadstring now.")
