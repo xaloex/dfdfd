@@ -1,10 +1,9 @@
--- [[ VANTA Maximum HTTP & Loadstring Sniffer / Dumper ]] --
+-- [[ VANTA JNKIE & HTTP Sniffer + Key Response Interceptor ]] --
 local os_date = os.date("%Y-%m-%d_%H-%M-%S")
 local base_folder = "shlushatel"
 local session_folder = base_folder .. "/" .. os_date
 local log_path = session_folder .. "/log.txt"
 
--- Safe FS creation
 local function safeMakeFolder(path)
     if isfolder and not isfolder(path) then
         pcall(makefolder, path)
@@ -44,14 +43,16 @@ local function dumpScript(code, source_info)
     return dump_filename
 end
 
-writeLog("=== MAXIMUM SNIFFER SESSION STARTED ===")
-writeLog("Session output directory: " .. session_folder)
+writeLog("=== JNKIE DECODER & HTTP SNIFFER STARTED ===")
+writeLog("Session directory: " .. session_folder)
 
--- Helper to safely clone functions if available
-local clone = clonefunction or function(f) return f end
+-- Check if SCRIPT_KEY is set, if not warn dj
+if type(getgenv().SCRIPT_KEY) ~= "string" and type(SCRIPT_KEY) ~= "string" then
+    writeLog("[WARNING] SCRIPT_KEY is not set in getgenv()!\nSet 'getgenv().SCRIPT_KEY = \"YOUR_KEY\"' before running the loader.")
+end
 
 --------------------------------------------------------------------------------
--- 1. HOOK ALL EXECUTOR REQUEST FUNCTIONS (Direct & Aliases)
+-- 1. HOOK ALL EXECUTOR REQUEST FUNCTIONS
 --------------------------------------------------------------------------------
 local request_targets = {
     {name = "request", fn = request},
@@ -82,7 +83,7 @@ for _, item in ipairs(request_targets) do
                 end
                 
                 writeLog(string.format(
-                    "[REQUEST OUTGOING via %s]\nMethod: %s\nURL: %s\nHeaders:%s\nBody:\n%s",
+                    "[HTTP REQUEST SENT via %s]\nMethod: %s\nURL: %s\nHeaders:%s\nBody / Key Sent:\n%s",
                     item.name, method, url, (headers ~= "" and headers or " None"), (body ~= "" and body or "<empty>")
                 ))
                 
@@ -92,16 +93,12 @@ for _, item in ipairs(request_targets) do
                     local status = tostring(response.StatusCode or response.StatusDescription or "200")
                     local resp_body = tostring(response.Body or response.body or "")
                     
-                    local resp_dump_file = ""
-                    if #resp_body > 300 then
-                        resp_dump_file = dumpScript(resp_body, "HTTP Response from " .. url)
-                    end
+                    local dumped_file = dumpScript(resp_body, "HTTP Response from " .. url .. " (Status: " .. status .. ")")
                     
                     writeLog(string.format(
-                        "[REQUEST RESPONSE via %s]\nURL: %s\nStatus: %s\nBody Length: %d bytes%s\nBody Preview:\n%s",
-                        item.name, url, status, #resp_body, 
-                        (resp_dump_file ~= "" and (" (Full saved to " .. resp_dump_file .. ")") or ""),
-                        (#resp_body > 300 and resp_body:sub(1, 300) .. "..." or resp_body)
+                        "[HTTP RESPONSE RECEIVED via %s]\nURL: %s\nStatus Code: %s\nSaved Payload to: %s\nResponse Body Preview:\n%s",
+                        item.name, url, status, dumped_file,
+                        (#resp_body > 400 and resp_body:sub(1, 400) .. "..." or resp_body)
                     ))
                 end
                 
@@ -110,82 +107,44 @@ for _, item in ipairs(request_targets) do
             return original(options)
         end)
         hooked_fns[item.fn] = true
-        writeLog("Successfully hooked executor function: " .. item.name)
+        writeLog("Hooked request function: " .. item.name)
     end
 end
 
 --------------------------------------------------------------------------------
--- 2. HOOK DIRECT GAME METHODS (game.HttpGet & game.HttpPost)
+-- 2. HOOK GAME HTTP METHODS
 --------------------------------------------------------------------------------
 if hookfunction then
     pcall(function()
         local orig_httpget
         orig_httpget = hookfunction(game.HttpGet, function(self, url, ...)
-            writeLog(string.format("[game.HttpGet Direct Call]\nURL: %s", tostring(url)))
+            writeLog(string.format("[game.HttpGet]\nURL: %s", tostring(url)))
             local res = orig_httpget(self, url, ...)
             if type(res) == "string" and #res > 0 then
                 local dumped = dumpScript(res, "game.HttpGet: " .. tostring(url))
-                writeLog(string.format("[game.HttpGet Response]\nURL: %s\nSaved to: %s\nPreview:\n%s", tostring(url), dumped, res:sub(1, 300)))
+                writeLog(string.format("[game.HttpGet Response]\nURL: %s\nSaved to: %s", tostring(url), dumped))
             end
             return res
         end)
-        writeLog("Hooked game.HttpGet directly.")
-    end)
-
-    pcall(function()
-        local orig_httppost
-        orig_httppost = hookfunction(game.HttpPost, function(self, url, data, ...)
-            writeLog(string.format("[game.HttpPost Direct Call]\nURL: %s\nData:\n%s", tostring(url), tostring(data)))
-            local res = orig_httppost(self, url, data, ...)
-            if type(res) == "string" and #res > 0 then
-                local dumped = dumpScript(res, "game.HttpPost: " .. tostring(url))
-                writeLog(string.format("[game.HttpPost Response]\nURL: %s\nSaved to: %s\nPreview:\n%s", tostring(url), dumped, res:sub(1, 300)))
-            end
-            return res
-        end)
-        writeLog("Hooked game.HttpPost directly.")
     end)
 end
 
 --------------------------------------------------------------------------------
--- 3. HOOK __namecall METAMETHOD FOR GAME INSTANCES
---------------------------------------------------------------------------------
-if hookmetamethod then
-    local old_namecall
-    old_namecall = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        if method == "HttpGet" or method == "HttpGetAsync" then
-            local args = {...}
-            local url = tostring(args[1])
-            writeLog(string.format("[__namecall %s]\nURL: %s", method, url))
-        elseif method == "HttpPost" or method == "HttpPostAsync" then
-            local args = {...}
-            local url = tostring(args[1])
-            local data = tostring(args[2] or "")
-            writeLog(string.format("[__namecall %s]\nURL: %s\nData:\n%s", method, url, data))
-        end
-        return old_namecall(self, ...)
-    end)
-    writeLog("Hooked __namecall metamethod.")
-end
-
---------------------------------------------------------------------------------
--- 4. HOOK LOADSTRING (Full dumper without truncation)
+-- 3. HOOK LOADSTRING
 --------------------------------------------------------------------------------
 if hookfunction and type(loadstring) == "function" then
     local old_loadstring
     old_loadstring = hookfunction(loadstring, function(code, chunkname)
-        local source_info = chunkname or "loadstring_call"
+        local source_info = chunkname or "loadstring_execution"
         local dumped_file = dumpScript(code, source_info)
         
         writeLog(string.format(
-            "[LOADSTRING INTERCEPTED]\nChunk: %s\nLength: %d bytes\nSaved full code to: %s\nCode Head (First 300 chars):\n%s",
+            "[LOADSTRING EXECUTED]\nChunk: %s\nLength: %d bytes\nSaved script code to: %s\nPreview:\n%s",
             tostring(source_info), #tostring(code), dumped_file, tostring(code):sub(1, 300)
         ))
         
         return old_loadstring(code, chunkname)
     end)
-    writeLog("Hooked loadstring completely with full dump support.")
 end
 
-writeLog("All hooks deployed successfully. Ready for script execution.")
+writeLog("Sniffer ready. Now run your loader script.")
