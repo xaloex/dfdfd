@@ -1623,6 +1623,17 @@ end
 -- Классификация таблицы по форме: это Constant Pool, Instruction Array,
 -- Proto Chunk Table или Virtual Registers?
 local function classify(t)
+	-- SELF-EXCLUDE: свои таблицы не классифицируем как добычу. Иначе
+	-- MULTI_OPS / KEYWORDS / лог-буферы выглядят как CONSTANT_POOL игры.
+	if t == S.shims or t == S.cap or t == S.structs or t == S.mainStructs
+		or t == S.mainStrings or t == S.decrypted or t == S.closureTree
+		or t == S.structIndex or t == S.opcodeOut or t == S.chunks
+		or t == S.stringsOut or t == S.blobs then
+		return { total = 0, numKeys = 0, strKeys = 0, maxNum = 0,
+			vNum = 0, vStr = 0, vFn = 0, vTbl = 0, vBool = 0,
+			density = 0, nestedWithOps = 0,
+			kind = "SELF", why = "своя таблица дампера", strSamples = {}, fnKeys = {} }
+	end
 	local numKeys, strKeys = 0, 0
 	local vNum, vStr, vFn, vTbl, vBool, vOther = 0, 0, 0, 0, 0, 0
 	local maxNum = 0
@@ -1691,6 +1702,25 @@ local function classify(t)
 	else
 		kind = "SMALL"
 		why = "маленькая"
+	end
+
+	-- SELF-CONTENT: таблица из наших строк (имена функций дампера, шим-строки,
+	-- MULTI_OPS) — не добыча. Иначе свой мусор выглядит как CONSTANT_POOL игры.
+	if kind == "CONSTANT_POOL" and vStr >= 4 and strKeys == 0 then
+		local selfHit = 0
+		for _, s in ipairs(strSamples) do
+			if s:find("brutalScan", 1, true) or s:find("collectDeep", 1, true)
+				or s:find("seedFromFunction", 1, true) or s:find("scanStructures", 1, true)
+				or s:find("flushFixes", 1, true) or s:find("scheduleScan", 1, true)
+				or s:find("buildClosureTree", 1, true) or s:find("created (", 1, true)
+				or s:find("installed", 1, true) then
+				selfHit = selfHit + 1
+			end
+		end
+		if selfHit >= 2 then
+			kind = "SELF"
+			why = "контент дампера (имена функций/логи/шимы)"
+		end
 	end
 
 	return {
@@ -1856,7 +1886,9 @@ function S.scanStructures()
 		local a = taddr(t)
 		if not S.structs[a] then
 			local ok, st = pcall(classify, t)
-			if ok and st and st.total >= S.cfg.minTableSize then
+			if ok and st and st.kind == "SELF" then
+				S.structs[a] = st
+			elseif ok and st and st.total >= S.cfg.minTableSize then
 				S.structs[a] = st
 				S.scanned = S.scanned + 1
 				found = found + 1
@@ -3138,7 +3170,9 @@ function S.brutalScan()
 		local a = taddr(t)
 		if not S.structs[a] then
 			local ok, st = pcall(classify, t)
-			if ok and st then
+			if ok and st and st.kind == "SELF" then
+				S.structs[a] = st
+			elseif ok and st then
 				S.structs[a] = st
 				if st.total >= math.min(S.cfg.minTableSize, 8) and st.kind ~= "SMALL" and st.kind ~= "EMPTY" then
 					S.scanned = S.scanned + 1
