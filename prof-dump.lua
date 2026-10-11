@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -241,8 +241,9 @@ local function isSelfFn(fn)
 	local a = selfAddr(fn)
 	if a and S.selfFnAddrs[a] then return true end
 
-	local ok, v = pcall(function() return fn.__profesHook end)
-	if ok and v == true then return true end
+	-- БЕЗ ИНДЕКСАЦИИ ФУНКЦИЙ: fn.__profesHook кидает
+	-- "attempt to index function" на части экзекуторов.
+	-- Метки хуков храним только в реестре через markSelfFn в tagHook.
 
 	-- Проверка upvalue: если функция ссылается на наш S или любую self-таблицу — это МЫ
 	local gu = rawget(genv, "getupvalues") or rawget(_G, "getupvalues")
@@ -892,22 +893,27 @@ end
 ---------------------------------------------------------------------------
 local function tagHook(fn, base)
 	if type(fn) ~= "function" then return fn end
-	pcall(function() fn.__profesHook = true end)
-	pcall(function() fn.__profesBase = base or fn end)
+	-- метка только в реестре: индексация функции (fn.__x) кидает
+	-- "attempt to index function" на части экзекуторов даже внутри pcall
+	markSelfFn(fn)
+	if type(base) == "function" then markSelfFn(base) end
+	if S.fnMarks == nil then S.fnMarks = setmetatable({}, { __mode = "k" }) end
+	S.fnMarks[fn] = base or fn
 	return fn
 end
 
 local function isOurHook(fn)
 	if type(fn) ~= "function" then return false end
-	local ok, v = pcall(function() return fn.__profesHook end)
-	return (ok and v == true) or false
+	if S.selfFns and S.selfFns[fn] then return true end
+	if S.fnMarks and S.fnMarks[fn] ~= nil then return true end
+	return false
 end
 
 local function baseOf(fn)
 	if type(fn) ~= "function" then return fn end
-	if isOurHook(fn) then
-		local ok, b = pcall(function() return fn.__profesBase end)
-		if ok and type(b) == "function" then return b end
+	if S.fnMarks then
+		local b = S.fnMarks[fn]
+		if type(b) == "function" then return b end
 	end
 	return fn
 end
@@ -1746,12 +1752,12 @@ local function collectTables()
 			end
 		end
 
-		-- поля функции: __profesBase указывает на оригинал, если мы обернули
-		for _, field in ipairs({"__profesBase", "__profesHook"}) do
-			local ok2, v = pcall(function() return fn[field] end)
-			if ok2 and type(v) == "table" then
-				add(v)
-				walkFn2(v, 0)
+		-- оригинал обёрнутого хука — из реестра меток (функции не индексируем)
+		if S.fnMarks then
+			local b = S.fnMarks[fn]
+			if type(b) == "table" then
+				add(b)
+				walkFn2(b, 0)
 			end
 		end
 	end
@@ -2916,10 +2922,10 @@ function S.collectDeep()
 				end
 			end
 		end
-		-- поля функции (наш хук держит orig)
-		for _, field in ipairs({"__profesBase"}) do
-			local ok2, v = pcall(function() return fn[field] end)
-			if ok2 and type(v) == "table" then addT(v) wDeepT(v, depth + 1) end
+		-- оригинал обёрнутого хука — из реестра меток (функции не индексируем)
+		if S.fnMarks then
+			local b = S.fnMarks[fn]
+			if type(b) == "table" then addT(b) wDeepT(b, depth + 1) end
 		end
 	end
 
