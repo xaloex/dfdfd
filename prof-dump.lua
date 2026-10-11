@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -213,7 +213,10 @@ local function isSelfFn(fn)
 	if type(fn) ~= "function" then return false end
 	local ok, v = pcall(function() return fn.__profesHook end)
 	if ok and v == true then return true end
-	-- константы наших функций содержат маркеры дампера
+	-- константы наших функций содержат маркеры дампера.
+	-- Наш файл запускается через loadstring ПЕРВЫМ — его скомпилированная
+	-- функция приходит в onChunk как чанк. Режем по широкому набору маркеров:
+	-- любое совпадение = это мы, не цель.
 	-- (прямой вызов getconstants: readConstants объявлен ниже по файлу)
 	local gc = rawget(genv, "getconstants") or rawget(_G, "getconstants")
 	if type(gc) ~= "function" then return false end
@@ -221,10 +224,17 @@ local function isSelfFn(fn)
 	if not okc or type(cs) ~= "table" then return false end
 	if type(cs) == "table" then
 		for _, c in pairs(cs) do
-			if type(c) == "string" and (c:find("__SCRIPT_PROFES_STATE", 1, true)
-				or c:find("FULL_DEOBFUSCATED", 1, true)
-				or c:find("brutalScan", 1, true)) then
-				return true
+			if type(c) == "string" then
+				if c:find("__SCRIPT_PROFES", 1, true) or c:find("__profesHook", 1, true)
+					or c:find("FULL_DEOBFUSCATED", 1, true) or c:find("brutalScan", 1, true)
+					or c:find("collectDeep", 1, true) or c:find("harvestLive", 1, true)
+					or c:find("buildClosureTree", 1, true) or c:find("Profes-Dump", 1, true)
+					or c:find("SCRIPT-PROFES", 1, true) or c:find("PROFES_", 1, true)
+					or c:find("seedTarget", 1, true) or c:find("seedFromFunction", 1, true)
+					or c:find("scanStructures", 1, true) or c:find("dumpVMState", 1, true)
+					or c:find("installLiveDecrypt", 1, true) or c:find("hookLiveFn", 1, true) then
+					return true
+				end
 			end
 		end
 	end
@@ -1596,7 +1606,7 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	end
 
 	if S.cfg.walkChunk and ok and type(compiled) == "function" then
-		pcall(S.seedFromFunction, compiled)
+		pcall(S.seedTarget, compiled)
 	end
 	pcall(S.scheduleScan)
 end
@@ -2098,6 +2108,8 @@ end
 S.chunkFns = {}
 S.seenFns = {}
 S.seenFnMap = {}
+S.targetFns = {}       -- ТОЛЬКО функции цели (из onChunk), наши сюда не входят
+S.targetFnMap = {}
 function S.seedFromFunction(fn)
 	if type(fn) ~= "function" then return end
 	if isSelfFn(fn) then return end
@@ -2106,6 +2118,17 @@ function S.seedFromFunction(fn)
 	if not S.seenFnMap[k] then
 		S.seenFnMap[k] = true
 		S.seenFns[#S.seenFns + 1] = fn
+	end
+end
+-- сид цели: вызывается ТОЛЬКО из onChunk (перехваченный чанк = цель)
+function S.seedTarget(fn)
+	if type(fn) ~= "function" then return end
+	if isSelfFn(fn) then return end
+	S.seedFromFunction(fn)
+	local k = tostring(fn)
+	if not S.targetFnMap[k] then
+		S.targetFnMap[k] = true
+		S.targetFns[#S.targetFns + 1] = fn
 	end
 end
 
@@ -3027,20 +3050,24 @@ function S.harvestLive()
 	for _, rec in ipairs(S.mainStructs or {}) do
 		if rec.t and type(rec.t) == "table" then eatTable(rec.t, 0) end
 	end
-	-- 2) upvalue всех известных функций (там регистры диспетчера)
-	for _, fn in ipairs(S.seenFns or {}) do
-		local uvs = readUpvalues(fn)
-		if type(uvs) == "table" then
-			for _, uv in pairs(uvs) do
-				if type(uv) == "string" then eatStr(uv)
-				elseif type(uv) == "table" then eatTable(uv, 0) end
+	-- 2) upvalue ТОЛЬКО функций цели (S.targetFns — посеяны из перехваченных
+	-- чанков в onChunk). Наши 700+ внутренних функций сюда не входят: раньше
+	-- выжималка ела наши же константы и забивала лимит 20000 без запуска цели.
+	for _, fn in ipairs(S.targetFns or {}) do
+		if not isSelfFn(fn) then
+			local uvs = readUpvalues(fn)
+			if type(uvs) == "table" then
+				for _, uv in pairs(uvs) do
+					if type(uv) == "string" then eatStr(uv)
+					elseif type(uv) == "table" then eatTable(uv, 0) end
+				end
 			end
-		end
-		-- 3) константы каждой функции (расшифрованные Luau-константы)
-		local cs = readConstants(fn)
-		if type(cs) == "table" then
-			for _, c in pairs(cs) do
-				if type(c) == "string" then eatStr(c) end
+			-- 3) константы каждой функции цели
+			local cs = readConstants(fn)
+			if type(cs) == "table" then
+				for _, c in pairs(cs) do
+					if type(c) == "string" then eatStr(c) end
+				end
 			end
 		end
 	end
