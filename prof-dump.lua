@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v22 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -166,9 +166,10 @@ if _G and _G ~= genv then pcall(rawset, _G, STATE_KEY, S) end
 -- в collectTables/collectDeep/harvestLive до классификации.
 S.selfTables = {}
 local function selfAddr(t)
+	if type(tostring) ~= "function" then return tostring(t) end
 	local ok, a = pcall(tostring, t)
 	if ok and type(a) == "string" then return a end
-	return nil
+	return "tbl_" .. tostring(#S.selfTables + 1)
 end
 local function markSelf(t)
 	if type(t) == "table" then
