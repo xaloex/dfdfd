@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v22 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -165,8 +165,16 @@ if _G and _G ~= genv then pcall(rawset, _G, STATE_KEY, S) end
 -- содержащая STATE_KEY в ключах/значениях — это МЫ, не добыча. Проверяется
 -- в collectTables/collectDeep/harvestLive до классификации.
 S.selfTables = {}
+local function selfAddr(t)
+	local ok, a = pcall(tostring, t)
+	if ok and type(a) == "string" then return a end
+	return nil
+end
 local function markSelf(t)
-	if type(t) == "table" then S.selfTables[taddr(t)] = true end
+	if type(t) == "table" then
+		local a = selfAddr(t)
+		if a then S.selfTables[a] = true end
+	end
 	return t
 end
 markSelf(S)
@@ -181,9 +189,12 @@ markSelf(S.cap or {})
 -- своя ли таблица: по реестру, по маркеру STATE_KEY внутри, по нашим хукам
 local function isSelfTable(t)
 	if type(t) ~= "table" then return false end
-	if S.selfTables[taddr(t)] then return true end
+	do
+		local a = selfAddr(t)
+		if a and S.selfTables[a] then return true end
+	end
 	-- таблица функций-хуков или состояний: ищем наши метки
-	local ok = pcall(function()
+	local ok, found = pcall(function()
 		for k, v in pairs(t) do
 			if k == STATE_KEY then return true end
 			if type(k) == "string" and (k == "__profesHook" or k == "__profesBase") then return true end
@@ -193,7 +204,7 @@ local function isSelfTable(t)
 		end
 		return false
 	end)
-	return ok == true
+	return ok and found == true
 end
 
 -- своя ли функция: наш хук (метка __profesHook) — не добыча, а инструмент
@@ -202,7 +213,11 @@ local function isSelfFn(fn)
 	local ok, v = pcall(function() return fn.__profesHook end)
 	if ok and v == true then return true end
 	-- константы наших функций содержат маркеры дампера
-	local cs = readConstants(fn)
+	-- (прямой вызов getconstants: readConstants объявлен ниже по файлу)
+	local gc = rawget(genv, "getconstants") or rawget(_G, "getconstants")
+	if type(gc) ~= "function" then return false end
+	local okc, cs = pcall(gc, fn)
+	if not okc or type(cs) ~= "table" then return false end
 	if type(cs) == "table" then
 		for _, c in pairs(cs) do
 			if type(c) == "string" and (c:find("__SCRIPT_PROFES_STATE", 1, true)
