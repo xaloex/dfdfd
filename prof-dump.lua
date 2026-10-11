@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v22 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -160,6 +160,60 @@ local S = {
 }
 rawset(genv, STATE_KEY, S)
 if _G and _G ~= genv then pcall(rawset, _G, STATE_KEY, S) end
+
+-- АНТИ-СЕБЯ: реестр всех своих таблиц. Любая таблица из этого реестра или
+-- содержащая STATE_KEY в ключах/значениях — это МЫ, не добыча. Проверяется
+-- в collectTables/collectDeep/harvestLive до классификации.
+S.selfTables = {}
+local function markSelf(t)
+	if type(t) == "table" then S.selfTables[taddr(t)] = true end
+	return t
+end
+markSelf(S)
+markSelf(S.cfg)
+markSelf(S.chunks)
+markSelf(S.seen)
+markSelf(S.structs)
+markSelf(S.shims)
+markSelf(S.logBuf)
+markSelf(S.cap or {})
+
+-- своя ли таблица: по реестру, по маркеру STATE_KEY внутри, по нашим хукам
+local function isSelfTable(t)
+	if type(t) ~= "table" then return false end
+	if S.selfTables[taddr(t)] then return true end
+	-- таблица функций-хуков или состояний: ищем наши метки
+	local ok = pcall(function()
+		for k, v in pairs(t) do
+			if k == STATE_KEY then return true end
+			if type(k) == "string" and (k == "__profesHook" or k == "__profesBase") then return true end
+			if v == S then return true end
+			if type(k) == "string" and k:find("__SCRIPT_PROFES_STATE", 1, true) then return true end
+			if type(v) == "string" and v:find("__SCRIPT_PROFES_STATE", 1, true) then return true end
+		end
+		return false
+	end)
+	return ok == true
+end
+
+-- своя ли функция: наш хук (метка __profesHook) — не добыча, а инструмент
+local function isSelfFn(fn)
+	if type(fn) ~= "function" then return false end
+	local ok, v = pcall(function() return fn.__profesHook end)
+	if ok and v == true then return true end
+	-- константы наших функций содержат маркеры дампера
+	local cs = readConstants(fn)
+	if type(cs) == "table" then
+		for _, c in pairs(cs) do
+			if type(c) == "string" and (c:find("__SCRIPT_PROFES_STATE", 1, true)
+				or c:find("FULL_DEOBFUSCATED", 1, true)
+				or c:find("brutalScan", 1, true)) then
+				return true
+			end
+		end
+	end
+	return false
+end
 
 ---------------------------------------------------------------------------
 -- 1. ФАЙЛЫ
@@ -1538,7 +1592,7 @@ local function collectTables()
 
 	local function add(t)
 		local a = taddr(t)
-		if not seen[a] then
+		if not seen[a] and not isSelfTable(t) then
 			seen[a] = true
 			out[#out + 1] = t
 		end
@@ -1566,6 +1620,7 @@ local function collectTables()
 	-- обход функций: их upvalue + собственные поля (наш хук держит orig в поле)
 	walkFn = function(fn, depth)
 		if type(fn) ~= "function" or depth > 6 then return end
+		if isSelfFn(fn) then return end
 		local key = taddr(fn)
 		if visitedFn[key] then return end
 		visitedFn[key] = true
@@ -1990,6 +2045,7 @@ S.seenFns = {}
 S.seenFnMap = {}
 function S.seedFromFunction(fn)
 	if type(fn) ~= "function" then return end
+	if isSelfFn(fn) then return end
 	S.chunkFns[#S.chunkFns + 1] = fn
 	local k = tostring(fn)
 	if not S.seenFnMap[k] then
@@ -2010,6 +2066,9 @@ end
 S.mainStrings = {}
 S.mainStructs = {}
 S.callLog = {}
+markSelf(S.mainStrings)
+markSelf(S.mainStructs)
+markSelf(S.callLog)
 
 local function vstr(v, cap)
 	v = tostring(v)
@@ -2639,6 +2698,7 @@ function S.collectDeep()
 
 	local function addT(t)
 		if type(t) ~= "table" then return end
+		if isSelfTable(t) then return end
 		local a = taddr(t)
 		if seenT[a] then return end
 		seenT[a] = true
@@ -2681,6 +2741,7 @@ function S.collectDeep()
 
 	wDeepF = function(fn, depth)
 		if type(fn) ~= "function" then return end
+		if isSelfFn(fn) then return end
 		if depth > (S.cfg.deepDepth or 8) then return end
 		local key = taddr(fn)
 		if seenF[key] then return end
