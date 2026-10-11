@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -108,6 +108,7 @@ local ORIG_COMPILER = pickOrig()
 
 local S = {
 	active = true,
+	armed = false,
 	dir = nil,
 	cfg = {
 		format = userCfg.format ~= false,
@@ -161,23 +162,39 @@ local S = {
 rawset(genv, STATE_KEY, S)
 if _G and _G ~= genv then pcall(rawset, _G, STATE_KEY, S) end
 
--- АНТИ-СЕБЯ: реестр всех своих таблиц. Любая таблица из этого реестра или
--- содержащая STATE_KEY в ключах/значениях — это МЫ, не добыча. Проверяется
--- в collectTables/collectDeep/harvestLive до классификации.
-S.selfTables = {}
+-- АНТИ-СЕБЯ: реестр всех своих таблиц и функций.
+-- Любая таблица/функция из этого реестра или содержащая маркеры дампера —
+-- это МЫ, не добыча. Отсекается до классификации и до занесения в пул.
+S.selfTables = setmetatable({}, { __mode = "k" })
+S.selfTableAddrs = {}
+S.selfFns = setmetatable({}, { __mode = "k" })
+S.selfFnAddrs = {}
+
 local function selfAddr(t)
 	if type(tostring) ~= "function" then return tostring(t) end
 	local ok, a = pcall(tostring, t)
 	if ok and type(a) == "string" then return a end
-	return "tbl_" .. tostring(#S.selfTables + 1)
+	return "obj_" .. tostring(t)
 end
+
 local function markSelf(t)
 	if type(t) == "table" then
+		S.selfTables[t] = true
 		local a = selfAddr(t)
-		if a then S.selfTables[a] = true end
+		if a then S.selfTableAddrs[a] = true end
 	end
 	return t
 end
+
+local function markSelfFn(fn)
+	if type(fn) == "function" then
+		S.selfFns[fn] = true
+		local a = selfAddr(fn)
+		if a then S.selfFnAddrs[a] = true end
+	end
+	return fn
+end
+
 markSelf(S)
 markSelf(S.cfg)
 markSelf(S.chunks)
@@ -186,54 +203,91 @@ markSelf(S.structs)
 markSelf(S.shims)
 markSelf(S.logBuf)
 markSelf(S.cap or {})
+markSelf(S.selfTables)
+markSelf(S.selfTableAddrs)
+markSelf(S.selfFns)
+markSelf(S.selfFnAddrs)
 
--- своя ли таблица: по реестру, по маркеру STATE_KEY внутри, по нашим хукам
+-- своя ли таблица: по прямому указателю, по строковому адресу, по маркерам
 local function isSelfTable(t)
 	if type(t) ~= "table" then return false end
-	do
-		local a = selfAddr(t)
-		if a and S.selfTables[a] then return true end
-	end
+	if S.selfTables[t] then return true end
+	local a = selfAddr(t)
+	if a and S.selfTableAddrs[a] then return true end
+
 	-- таблица функций-хуков или состояний: ищем наши метки
 	local ok, found = pcall(function()
 		for k, v in pairs(t) do
-			if k == STATE_KEY then return true end
+			if k == STATE_KEY or v == STATE_KEY then return true end
 			if type(k) == "string" and (k == "__profesHook" or k == "__profesBase") then return true end
-			if v == S then return true end
-			if type(k) == "string" and k:find("__SCRIPT_PROFES_STATE", 1, true) then return true end
-			if type(v) == "string" and v:find("__SCRIPT_PROFES_STATE", 1, true) then return true end
+			if v == S or k == S then return true end
+			if type(k) == "string" and (k:find("__SCRIPT_PROFES", 1, true) or k:find("PROFES_", 1, true)) then return true end
+			if type(v) == "string" and (v:find("__SCRIPT_PROFES", 1, true) or v:find("Profes-Dump", 1, true)) then return true end
 		end
 		return false
 	end)
-	return ok and found == true
+	if ok and found == true then
+		S.selfTables[t] = true
+		if a then S.selfTableAddrs[a] = true end
+		return true
+	end
+	return false
 end
 
--- своя ли функция: наш хук (метка __profesHook) — не добыча, а инструмент
+-- своя ли функция: наш хук, по реестру, по upvalue к S, по маркерам
 local function isSelfFn(fn)
 	if type(fn) ~= "function" then return false end
+	if S.selfFns[fn] then return true end
+	local a = selfAddr(fn)
+	if a and S.selfFnAddrs[a] then return true end
+
 	local ok, v = pcall(function() return fn.__profesHook end)
 	if ok and v == true then return true end
-	-- константы наших функций содержат маркеры дампера.
-	-- Наш файл запускается через loadstring ПЕРВЫМ — его скомпилированная
-	-- функция приходит в onChunk как чанк. Режем по широкому набору маркеров:
-	-- любое совпадение = это мы, не цель.
-	-- (прямой вызов getconstants: readConstants объявлен ниже по файлу)
-	local gc = rawget(genv, "getconstants") or rawget(_G, "getconstants")
-	if type(gc) ~= "function" then return false end
-	local okc, cs = pcall(gc, fn)
-	if not okc or type(cs) ~= "table" then return false end
-	if type(cs) == "table" then
-		for _, c in pairs(cs) do
-			if type(c) == "string" then
-				if c:find("__SCRIPT_PROFES", 1, true) or c:find("__profesHook", 1, true)
-					or c:find("FULL_DEOBFUSCATED", 1, true) or c:find("brutalScan", 1, true)
-					or c:find("collectDeep", 1, true) or c:find("harvestLive", 1, true)
-					or c:find("buildClosureTree", 1, true) or c:find("Profes-Dump", 1, true)
-					or c:find("SCRIPT-PROFES", 1, true) or c:find("PROFES_", 1, true)
-					or c:find("seedTarget", 1, true) or c:find("seedFromFunction", 1, true)
-					or c:find("scanStructures", 1, true) or c:find("dumpVMState", 1, true)
-					or c:find("installLiveDecrypt", 1, true) or c:find("hookLiveFn", 1, true) then
+
+	-- Проверка upvalue: если функция ссылается на наш S или любую self-таблицу — это МЫ
+	local gu = rawget(genv, "getupvalues") or rawget(_G, "getupvalues")
+	if type(gu) == "function" then
+		local oku, uvs = pcall(gu, fn)
+		if oku and type(uvs) == "table" then
+			for _, uv in pairs(uvs) do
+				if uv == S or (type(uv) == "table" and (S.selfTables[uv] or (a and S.selfTableAddrs[selfAddr(uv)]))) then
+					S.selfFns[fn] = true
+					if a then S.selfFnAddrs[a] = true end
 					return true
+				end
+			end
+		end
+	elseif type(debug) == "table" and type(debug.getupvalue) == "function" then
+		for i = 1, 64 do
+			local oku, _, uv = pcall(debug.getupvalue, fn, i)
+			if not oku or uv == nil then break end
+			if uv == S or (type(uv) == "table" and (S.selfTables[uv] or (a and S.selfTableAddrs[selfAddr(uv)]))) then
+				S.selfFns[fn] = true
+				if a then S.selfFnAddrs[a] = true end
+				return true
+			end
+		end
+	end
+
+	-- константы наших функций содержат маркеры дампера
+	local gc = rawget(genv, "getconstants") or rawget(_G, "getconstants")
+	if type(gc) == "function" then
+		local okc, cs = pcall(gc, fn)
+		if okc and type(cs) == "table" then
+			for _, c in pairs(cs) do
+				if type(c) == "string" then
+					if c:find("__SCRIPT_PROFES", 1, true) or c:find("__profesHook", 1, true)
+						or c:find("FULL_DEOBFUSCATED", 1, true) or c:find("brutalScan", 1, true)
+						or c:find("collectDeep", 1, true) or c:find("harvestLive", 1, true)
+						or c:find("buildClosureTree", 1, true) or c:find("Profes-Dump", 1, true)
+						or c:find("SCRIPT-PROFES", 1, true) or c:find("PROFES_", 1, true)
+						or c:find("seedTarget", 1, true) or c:find("seedFromFunction", 1, true)
+						or c:find("scanStructures", 1, true) or c:find("dumpVMState", 1, true)
+						or c:find("installLiveDecrypt", 1, true) or c:find("hookLiveFn", 1, true) then
+						S.selfFns[fn] = true
+						if a then S.selfFnAddrs[a] = true end
+						return true
+					end
 				end
 			end
 		end
@@ -910,6 +964,8 @@ local KNOWN_GLOBALS = {
 	["identifyexecutor"]=true, ["getexecutorname"]=true, ["getgc"]=true,
 	["Synapse"]=true, ["Fluxus"]=true, ["Krnl"]=true, ["Solara"]=true,
 }
+markSelf(LUA_KEYWORDS)
+markSelf(KNOWN_GLOBALS)
 
 local SCAN_LIMIT = 7000000
 
@@ -1062,6 +1118,11 @@ local STMT_START_KW = {
 	["local"] = true, ["return"] = true, ["if"] = true, ["while"] = true,
 	["for"] = true, ["function"] = true, ["repeat"] = true, ["break"] = true,
 }
+markSelf(MULTI_OPS)
+markSelf(NO_SPACE_BEFORE)
+markSelf(NO_SPACE_AFTER)
+markSelf(WORD_THEN_SPACE)
+markSelf(STMT_START_KW)
 
 local function matchOp(s, i)
 	for k = 1, #MULTI_OPS do
@@ -1480,14 +1541,25 @@ end
 -- 9. ПЕРЕХВАТ CHUNK-А
 ---------------------------------------------------------------------------
 function S.onChunk(src, chunkname, tag, ok, compiled)
+	-- ARM-РЕЖИМ: берём ТОЛЬКО то, что запущено ПОСЛЕ нашего скрипта.
+	-- До взвода дампера ничего не захватываем.
+	if not S.armed then
+		return
+	end
+	if S.armedAt and os.clock() < S.armedAt then return end
+
 	if type(src) == "function" then
-		-- функции мимо ARM не пускаем тоже: только после вооружения
-		if S.armed == false then return end
+		if isSelfFn(src) then return end
 		local dok, dumped = pcall(string.dump, src)
 		if dok and type(dumped) == "string" then
 			S.counter = S.counter + 1
 			S.saveRaw("chunk_" .. S.counter .. "_fn.dump.bin", dumped)
 			S.save("chunk_" .. S.counter .. "_fn.dump.b64.txt", b64(dumped))
+		end
+		if S.cfg.walkChunk then
+			pcall(S.seedTarget, src)
+			pcall(S.scheduleScan)
+			pcall(S.startMobilePoller)
 		end
 		return
 	end
@@ -1495,16 +1567,11 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	if src:find("__PROFES_PROBE__", 1, true) then return end
 	if src:find(STATE_KEY, 1, true) then return end
 	-- АНТИ-СЕБЯ ПО СОДЕРЖИМОМУ: наш исходник содержит эти маркеры.
-	-- Если чанк — это мы (перезапуск/копия), не берём его никогда.
+	-- Если чанк — это мы (перезапуск/копия/loadstring дампера), не берём его никогда.
 	if src:find("FULL_DEOBFUSCATED", 1, true) and src:find("brutalScan", 1, true) then return end
-	if src:find("SCRIPT-PROFES v2", 1, true) then return end
-	-- ARM-РЕЖИМ: берём ТОЛЬКО то, что запущено ПОСЛЕ нашего скрипта.
-	-- Сперва наш дампер, потом твой loadstring — всё до взвода отсекается.
-	if S.armed == false then
-		S.log("pre-arm chunk skipped (" .. tag .. ", len=" .. #src .. ")")
-		return
-	end
-	if S.armedAt and os.clock() < S.armedAt then return end
+	if src:find("SCRIPT-PROFES", 1, true) then return end
+	if src:find("__profesHook", 1, true) or src:find("__profesBase", 1, true) then return end
+	if ok and type(compiled) == "function" and isSelfFn(compiled) then return end
 
 	S.counter = S.counter + 1
 	local n = S.counter
@@ -1609,6 +1676,7 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 		pcall(S.seedTarget, compiled)
 	end
 	pcall(S.scheduleScan)
+	pcall(S.startMobilePoller)
 end
 S.stringsOut = {}
 
@@ -1717,12 +1785,8 @@ end
 -- Классификация таблицы по форме: это Constant Pool, Instruction Array,
 -- Proto Chunk Table или Virtual Registers?
 local function classify(t)
-	-- SELF-EXCLUDE: свои таблицы не классифицируем как добычу. Иначе
-	-- MULTI_OPS / KEYWORDS / лог-буферы выглядят как CONSTANT_POOL игры.
-	if t == S.shims or t == S.cap or t == S.structs or t == S.mainStructs
-		or t == S.mainStrings or t == S.decrypted or t == S.closureTree
-		or t == S.structIndex or t == S.opcodeOut or t == S.chunks
-		or t == S.stringsOut or t == S.blobs then
+	-- SELF-EXCLUDE: свои таблицы не классифицируем как добычу.
+	if isSelfTable(t) then
 		return { total = 0, numKeys = 0, strKeys = 0, maxNum = 0,
 			vNum = 0, vStr = 0, vFn = 0, vTbl = 0, vBool = 0,
 			density = 0, nestedWithOps = 0,
@@ -1997,8 +2061,9 @@ local function dumpStructure(idx, t, st)
 	end
 end
 
-function S.scanStructures()
+function S.scanStructures(force)
 	if not S.cfg.structures then return 0 end
+	if not force and #S.chunks == 0 and #S.targetFns == 0 then return 0 end
 	S.sweepCount = S.sweepCount + 1
 	local tables = collectTables()
 	local found = 0
@@ -2045,6 +2110,7 @@ end
 -- делает scanStructures + brutalScan + flush. Останавливается сам.
 function S.startMobilePoller()
 	if S.pollerStarted then return end
+	if not S.armed or (#S.chunks == 0 and #S.targetFns == 0) then return end
 	S.pollerStarted = true
 	local interval = S.cfg.mobilePoll or 1.5
 	local total = S.cfg.mobileSweeps or 40
@@ -2402,8 +2468,9 @@ function S.installCallTracer(protos, name)
 end
 
 -- Собираем main из всех структур сразу
-function S.dumpMain()
+function S.dumpMain(force)
 	if not S.cfg.structures then return 0 end
+	if not force and #S.chunks == 0 and #S.targetFns == 0 then return 0 end
 	local found = 0
 	for idx, rec in ipairs(S.mainStructs) do
 		local t = rec.t
@@ -2446,7 +2513,8 @@ function S.dumpMain()
 end
 
 -- Состояние виртуальных регистров самого интерпретатора (обычно большой upvalue)
-function S.dumpVMState()
+function S.dumpVMState(force)
+	if not force and #S.chunks == 0 and #S.targetFns == 0 then return 0 end
 	local n = 0
 	local seen = {}
 	local function consider(fn, label, depth)
@@ -3154,7 +3222,7 @@ function S.buildClosureTree(fns)
 	local visited = {}
 	local out = S.closureTree
 	local function walk(fn, depth)
-		if type(fn) ~= "function" or depth > 10 then return end
+		if type(fn) ~= "function" or depth > 10 or isSelfFn(fn) then return end
 		local k = taddr(fn)
 		if visited[k] then return end
 		visited[k] = true
@@ -3208,9 +3276,9 @@ function S.buildClosureTree(fns)
 				for _, p in ipairs(list) do walk(p, depth + 1) end
 			end
 		end
+	for _, fn in ipairs(fns or S.seenFns or {}) do
+		if not isSelfFn(fn) then walk(fn, 0) end
 	end
-	for _, fn in ipairs(fns or S.seenFns or {}) do walk(fn, 0) end
-	if #out > 0 then
 		S.save("main/closure_tree.txt", table.concat(out, "\n") .. "\n")
 	end
 end
@@ -3221,7 +3289,10 @@ end
 -- через карту опкодов, живые регистры, closure-дерево, все строки + живая
 -- расшифровка. Опкоды рандомизированы, поэтому инструкции идут псевдокодом
 -- "OP_<hex>(...)" с подсказкой из inferOpcode — честнее, чем выдуманный Lua.
-function S.buildFullDeobfuscated()
+function S.buildFullDeobfuscated(force)
+	if not force and #S.chunks == 0 and #S.targetFns == 0 and #(S.mainStructs or {}) == 0 then
+		return 0
+	end
 	local L = {}
 	L[#L + 1] = "--[[══════════════════════════════════════════════════"
 	L[#L + 1] = "  FULL DEOBFUSCATED — главный скрипт, собран из памяти VM"
@@ -3417,6 +3488,10 @@ function S.buildFullDeobfuscated()
 		L[#L + 1] = ""
 	end
 
+	if nPool == 0 and nProto == 0 and nInstr == 0 and nState == 0 then
+		return 0
+	end
+
 	L[#L + 1] = string.format("-- pools=%d protos=%d instr=%d states=%d decrypted=%d",
 		nPool, nProto, nInstr, nState, #S.decrypted)
 	local text = table.concat(L, "\n") .. "\n"
@@ -3430,8 +3505,9 @@ end
 
 -- BRUTAL-скан: глубокий сбор + классификация всего + дерево + реконструктор.
 -- Вызывается из scheduleScan цепочкой и из PROFES_SCAN / PROFES_MAIN.
-function S.brutalScan()
+function S.brutalScan(force)
 	if not S.cfg.brutal then return 0 end
+	if not force and #S.chunks == 0 and #S.targetFns == 0 then return 0 end
 	pcall(S.installLiveDecrypt)
 	local deepT, deepF = S.collectDeep()
 	local found = 0
@@ -3453,8 +3529,10 @@ function S.brutalScan()
 			end
 		end
 	end
-	-- функции из глубокого сбора — в общий пул для dumpVMState/closure-дерева
-	for _, fn in ipairs(deepF) do S.seedFromFunction(fn) end
+	-- функции из глубокого сбора — в общий пул для dumpVMState/closure-дерева (только чужие)
+	for _, fn in ipairs(deepF) do
+		if not isSelfFn(fn) then S.seedFromFunction(fn) end
+	end
 	pcall(S.buildClosureTree, deepF)
 	-- ВЫЖИМАЛКА: строки из живых регистров + константы функций — каждый проход
 	local okH, gotH = pcall(S.harvestLive)
@@ -3583,16 +3661,47 @@ local function installAll()
 	return hookCount
 end
 
+local function snapshotBaseline()
+	markSelf(LUA_KEYWORDS)
+	markSelf(KNOWN_GLOBALS)
+	markSelf(MULTI_OPS)
+	markSelf(NO_SPACE_BEFORE)
+	markSelf(NO_SPACE_AFTER)
+	markSelf(WORD_THEN_SPACE)
+	markSelf(STMT_START_KW)
+	if type(S) == "table" then
+		for _, v in pairs(S) do
+			if type(v) == "table" then markSelf(v) end
+		end
+	end
+
+	local getgcFn = rawget(genv, "getgc") or rawget(_G, "getgc")
+	if type(getgcFn) == "function" then
+		for _, inc in ipairs({true, false}) do
+			local ok, objs = pcall(getgcFn, inc)
+			if ok and type(objs) == "table" then
+				for _, obj in ipairs(objs) do
+					if type(obj) == "function" then
+						markSelfFn(obj)
+					elseif type(obj) == "table" then
+						markSelf(obj)
+					end
+				end
+			end
+		end
+	end
+end
+
 installAll()
 S.flush()
+pcall(snapshotBaseline)
 -- ARM: с этого момента берём чанки. Всё, что было ДО (включая наш же
 -- исходник при перезапуске), отсекается в onChunk. Схема: сперва наш
 -- скрипт, потом твой loadstring — добыча только из второго.
 S.armed = true
 S.armedAt = os.clock()
-S.log("ARMED: chunks from now on will be captured")
--- MOBILE: долгий опрос памяти стартует сам — на телефоне структуры VM
--- появляются поздно, одного свипа не хватает. Плюс capability-строка в лог.
+S.log("ARMED: waiting for target script to execute")
+-- MOBILE: capability-строка в лог
 S.save("capabilities.txt", (function()
 	local c = S.cap
 	local ks = {}
@@ -3602,19 +3711,18 @@ S.save("capabilities.txt", (function()
 	for _, k in ipairs(ks) do o[#o + 1] = string.format("  %-16s %s", k, tostring(c[k])) end
 	return table.concat(o, "\n") .. "\n"
 end)())
-pcall(S.startMobilePoller)
 
 ---------------------------------------------------------------------------
 -- 13. РУЧНЫЕ КОМАНДЫ
 ---------------------------------------------------------------------------
 genv.PROFES_STATUS = function()
-	return string.format("dir=%s chunks=%d structures=%d sweeps=%d hooks=%d",
-		tostring(S.dir), S.counter, S.scanned, S.sweepCount, hookCount)
+	return string.format("dir=%s chunks=%d structures=%d sweeps=%d hooks=%d armed=%s",
+		tostring(S.dir), S.counter, S.scanned, S.sweepCount, hookCount, tostring(S.armed))
 end
 
 genv.PROFES_SCAN = function()
-	local n = S.scanStructures()
-	pcall(S.brutalScan)
+	local n = S.scanStructures(true)
+	pcall(S.brutalScan, true)
 	S.flush()
 	print("[Profes] structures found: " .. tostring(n) .. " | " .. genv.PROFES_STATUS())
 	return n
@@ -3623,8 +3731,8 @@ end
 -- принудительная выгрузка main-скрипта из уже найденных структур
 genv.PROFES_MAIN = function()
 	S.mainStrings = {}
-	local n = S.dumpMain()
-	local m = S.dumpVMState()
+	local n = S.dumpMain(true)
+	local m = S.dumpVMState(true)
 	local b = 0
 	if S.cfg.brutal then
 		local deepT, deepF = S.collectDeep()
@@ -3632,15 +3740,17 @@ genv.PROFES_MAIN = function()
 			local a = taddr(t)
 			if not S.structs[a] then
 				local ok, st = pcall(classify, t)
-				if ok and st and st.total >= 8 and st.kind ~= "SMALL" and st.kind ~= "EMPTY" then
+				if ok and st and st.total >= 8 and st.kind ~= "SMALL" and st.kind ~= "EMPTY" and st.kind ~= "SELF" then
 					S.structs[a] = st
 					S.mainStructs[#S.mainStructs + 1] = { t = t, kind = st.kind, stat = st }
 				end
 			end
 		end
-		for _, fn in ipairs(deepF) do S.seedFromFunction(fn) end
+		for _, fn in ipairs(deepF) do
+			if not isSelfFn(fn) then S.seedFromFunction(fn) end
+		end
 		pcall(S.buildClosureTree, deepF)
-		local okB, resB = pcall(S.buildFullDeobfuscated)
+		local okB, resB = pcall(S.buildFullDeobfuscated, true)
 		if okB and type(resB) == "number" then b = resB end
 	end
 	pcall(S.flushDecrypted)
@@ -3652,12 +3762,12 @@ end
 
 -- полный фулл-дамп одной командой: скан + brutal + main + flush
 genv.PROFES_FULL = function()
-	pcall(S.scanStructures)
-	pcall(S.brutalScan)
+	pcall(S.scanStructures, true)
+	pcall(S.brutalScan, true)
 	S.mainStrings = {}
-	pcall(S.dumpMain)
-	pcall(S.dumpVMState)
-	local b = pcall(S.buildFullDeobfuscated)
+	pcall(S.dumpMain, true)
+	pcall(S.dumpVMState, true)
+	local b = pcall(S.buildFullDeobfuscated, true)
 	pcall(S.flushDecrypted)
 	S.flush()
 	pcall(S.flushFixes)
@@ -3674,6 +3784,7 @@ end
 -- Жми перед запуском целевого loadstring, если дампер стоял давно.
 genv.PROFES_ARM = function()
 	S.counter = S.counter -- счётчик не трогаем, чтобы не перетереть файлы
+	pcall(snapshotBaseline)
 	S.armed = true
 	S.armedAt = os.clock()
 	S.log("RE-ARMED by user")
@@ -3682,7 +3793,7 @@ genv.PROFES_ARM = function()
 end
 
 genv.PROFES_VMSTATE = function()
-	local n = S.dumpVMState()
+	local n = S.dumpVMState(true)
 	S.flush()
 	print("[Profes] VM state tables: " .. tostring(n))
 	return n
@@ -3703,20 +3814,18 @@ end
 
 genv.PROFES_RETRY = function()
 	installAll()
+	pcall(snapshotBaseline)
 	S.flush()
 	print("[Profes] re-hooked: " .. genv.PROFES_STATUS())
 end
 
 print("======================================================")
-print("  SCRIPT-PROFES v2 BRUTAL+MOBILE - RUNNING")
+print("  SCRIPT-PROFES v2 BRUTAL+MOBILE - READY & ARMED")
 print("  folder: workspace/" .. S.dir)
 print("  hooks: " .. hookCount)
-print("  mobile Hollow: getgc=" .. tostring(S.cap.getgc)
-	.. " protos=" .. tostring(S.cap.getprotos)
-	.. " consts=" .. tostring(S.cap.getconstants)
-	.. " upvals=" .. tostring(S.cap.canUpvals))
-print("  1) run your obfuscated script / loadstring")
-print("  2) sweeps run automatically, or PROFES_SCAN() / PROFES_FULL()")
-print("  3) main: main/FULL_DEOBFUSCATED.lua")
+print("  status: ОЖИДАНИЕ ЦЕЛЕВОГО СКРИПТА (дампер готов)")
+print("  1) Запусти свой обфусцированный скрипт (loadstring)")
+print("  2) Захват и деобфускация начнутся автоматически")
+print("  3) Результат: main/FULL_DEOBFUSCATED.lua")
 print("======================================================")
-notify("Script-Profes", "Ready! " .. S.dir)
+notify("Script-Profes", "Ready & Armed! Waiting for target...")
