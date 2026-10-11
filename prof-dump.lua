@@ -2792,28 +2792,67 @@ function S.installLiveDecrypt()
 	S.liveInstalled = true
 	local function noteStr(s, tag)
 		if type(s) ~= "string" then return end
-		if #s < 4 or #s > 2000 then return end
-		-- осмысленная строка: буквы/цифры/пути, а не бинарный мусор
-		if not s:find("[%a][%a][%a]") then return end
+		if #s < 3 or #s > 4000 then return end
+		-- было 3 буквы подряд — резало короткие игровые ключи ("Gui", "Pet");
+		-- теперь мягче: хоть 2 буквы/цифры и без нулей
+		if not s:find("[%a][%a]") and not s:find("[%a]%d") then return end
 		if s:find("\0", 1, true) then return end
 		local h = hashStr(s)
 		if S.decryptedSeen[h] then return end
-		if #S.decrypted > 15000 then return end
+		if #S.decrypted > 40000 then return end
 		S.decryptedSeen[h] = true
 		S.decrypted[#S.decrypted + 1] = { tag = tag, s = s }
 	end
 	local function scanArgs(a)
-		for i = 1, a.n do noteStr(a[i], "arg") end
+		for i = 1, a.n do
+			noteStr(a[i], "arg")
+			-- таблицы-аргументы: дёргаем строки изнутри (константы пачками)
+			if type(a[i]) == "table" then
+				local ok = pcall(function()
+					for _, vv in pairs(a[i]) do noteStr(vv, "argtbl") end
+				end)
+				if not ok then break end
+			end
+		end
 	end
 	local function scanRes(r)
-		for i = 1, r.n do noteStr(r[i], "ret") end
+		for i = 1, r.n do
+			noteStr(r[i], "ret")
+			if type(r[i]) == "table" then
+				local ok = pcall(function()
+					for _, vv in pairs(r[i]) do noteStr(vv, "rettbl") end
+				end)
+				if not ok then break end
+			end
+		end
 	end
+	-- ШИРОКИЙ НЕВОД: всё, чем VM может собирать строки при расшифровке.
+	-- Каждый хук только ЧИТАЕТ аргументы/результат, поведение не меняет.
 	pcall(hookLiveFn, string, "char", function(a, r) scanRes(r) end)
-	pcall(hookLiveFn, string, "sub", function(a, r) scanRes(r) end)
-	pcall(hookLiveFn, string, "byte", function(a, r) end)
-	pcall(hookLiveFn, table, "concat", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "sub", function(a, r) scanRes(r) scanArgs(a) end)
+	pcall(hookLiveFn, string, "rep", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "format", function(a, r) scanRes(r) scanArgs(a) end)
+	pcall(hookLiveFn, string, "gsub", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "lower", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "upper", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "reverse", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "byte", function(a, r) scanArgs(a) end)
+	pcall(hookLiveFn, table, "concat", function(a, r) scanRes(r) scanArgs(a) end)
 	pcall(hookLiveFn, table, "insert", function(a, r) scanArgs(a) end)
-	S.log("live decrypt hooks installed (string.char/sub, table.concat/insert)")
+	pcall(hookLiveFn, table, "unpack", function(a, r) scanRes(r) end)
+	if type(table.pack) == "function" then
+		pcall(hookLiveFn, table, "pack", function(a, r) scanArgs(a) end)
+	end
+	-- buffer: VM таскает байткод/константы через него
+	local bufH = rawget(_G, "buffer") or rawget(genv, "buffer")
+	if type(bufH) == "table" then
+		pcall(hookLiveFn, bufH, "tostring", function(a, r) scanRes(r) end)
+		pcall(hookLiveFn, bufH, "readstring", function(a, r) scanRes(r) end)
+	end
+	-- bit32: сами по себе строк не дают, но их аргументы — индексы в пулы;
+	-- не хукаем (шум), вместо этого хукаем tostring/tonumber на выходах
+	pcall(hookLiveFn, _G, "tostring", function(a, r) scanRes(r) end)
+	S.log("live decrypt hooks installed (string.* x9, table.* x4, buffer, tostring)")
 end
 
 function S.flushDecrypted()
@@ -2825,6 +2864,56 @@ function S.flushDecrypted()
 		out[#out + 1] = string.format("[%s] %q", e.tag, e.s)
 	end
 	S.save("main/DECRYPTED_CONSTANTS.txt", table.concat(out, "\n") .. "\n")
+end
+
+-- ВЫЖИМАЛКА: каждый свип дёргает строки из живых таблиц VM (регистры,
+-- upvalue-хранилища) и константы всех известных функций через readConstants.
+-- Это главный источник ИГРОВЫХ строк: пулы шифрованы, а в работе VM строки
+-- лежат расшифрованными в регистрах и upvalue.
+function S.harvestLive()
+	local got = 0
+	local function eatStr(s)
+		if type(s) ~= "string" then return end
+		if #s < 2 or #s > 4000 then return end
+		if s:find("\0", 1, true) then return end
+		if not s:find("[%a]") then return end
+		if #S.mainStrings > (S.cfg.maxDumpStrings or 20000) then return end
+		S.mainStrings[#S.mainStrings + 1] = s
+		got = got + 1
+	end
+	local function eatTable(t, depth)
+		if depth > 3 or #S.mainStrings > (S.cfg.maxDumpStrings or 20000) then return end
+		local ok = pcall(pairs, t)
+		if not ok then return end
+		for k, v in pairs(t) do
+			if type(v) == "string" then eatStr(v)
+			elseif type(v) == "table" then eatTable(v, depth + 1)
+			end
+			if type(k) == "string" and #k > 2 and #k < 200 then eatStr(k) end
+		end
+	end
+	-- 1) все уже найденные структуры: выжать строки изнутри
+	for _, rec in ipairs(S.mainStructs or {}) do
+		if rec.t and type(rec.t) == "table" then eatTable(rec.t, 0) end
+	end
+	-- 2) upvalue всех известных функций (там регистры диспетчера)
+	for _, fn in ipairs(S.seenFns or {}) do
+		local uvs = readUpvalues(fn)
+		if type(uvs) == "table" then
+			for _, uv in pairs(uvs) do
+				if type(uv) == "string" then eatStr(uv)
+				elseif type(uv) == "table" then eatTable(uv, 0) end
+			end
+		end
+		-- 3) константы каждой функции (расшифрованные Luau-константы)
+		local cs = readConstants(fn)
+		if type(cs) == "table" then
+			for _, c in pairs(cs) do
+				if type(c) == "string" then eatStr(c) end
+			end
+		end
+	end
+	return got
 end
 
 -- ECR-декодер: контейнер "\27LUA" + байт-ключ + EOR-поток (как в script_memory)
@@ -3073,12 +3162,30 @@ function S.buildFullDeobfuscated()
 			elseif kind == "INSTRUCTION_ARRAY" then
 				nInstr = nInstr + 1
 				L[#L + 1] = string.format("-- ━━━ INSTRUCTIONS #%d (main/%03d_%s, псевдокод) ━━━", nInstr, idx, kind)
-				L[#L + 1] = "-- формат: PC  OP_<hex>(операнды)  -- подсказка из констант обработчика"
+				L[#L + 1] = "-- формат: PC  OP_<hex>(операнды)  -- подсказка + K[индекс]=строка из пулов"
 				-- карта opcode -> label из уже собранного opcodeOut
 				local opLabel = {}
 				for _, line in ipairs(S.opcodeOut or {}) do
 					local num, label = line:match("%((%d+)%)%s+line%s+%S+%s+(%S+)")
 					if num then opLabel[tonumber(num)] = label end
+				end
+				-- УЯЗВИМОСТЬ: операнды инструкций — это ИНДЕКСЫ в Constant Pool.
+				-- Строим общий индекс пулов: число -> строка, чтобы подставлять
+				-- K[n]="..." прямо в псевдокод. Это превращает OP_0xHH(17,42)
+				-- в читаемое OP_0xHH(K17="FireServer", K42="...").
+				if not S.poolIndex then
+					S.poolIndex = {}
+					for _, rec2 in ipairs(S.mainStructs or {}) do
+						local t2 = rec2.t
+						if t2 and (rec2.kind == "CONSTANT_POOL" or rec2.kind == "MIXED_TABLE" or rec2.kind == "NUMERIC_POOL") then
+							for k2, v2 in pairs(t2) do
+								if type(k2) == "number" and type(v2) == "string"
+									and #v2 >= 2 and #v2 <= 300 and S.poolIndex[k2] == nil then
+									S.poolIndex[k2] = v2
+								end
+							end
+						end
+					end
 				end
 				local idxs = {}
 				for k in pairs(t) do if type(k) == "number" then idxs[#idxs + 1] = k end end
@@ -3092,7 +3199,12 @@ function S.buildFullDeobfuscated()
 							if (kk == 1 or kk == "op" or kk == "opcode") and type(vv) == "number" then
 								op = vv
 							else
-								if #rest < 8 then rest[#rest + 1] = tostring(kk) .. "=" .. vstr(vv, 30) end
+								-- операнд-число: пробуем разрешить через пул
+								if type(vv) == "number" and S.poolIndex and S.poolIndex[vv] then
+									if #rest < 8 then rest[#rest + 1] = string.format("%s=K%d=%q", tostring(kk), vv, S.poolIndex[vv]:sub(1, 40)) end
+								else
+									if #rest < 8 then rest[#rest + 1] = tostring(kk) .. "=" .. vstr(vv, 30) end
+								end
 							end
 						end
 						if op then
@@ -3186,11 +3298,17 @@ function S.brutalScan()
 	-- функции из глубокого сбора — в общий пул для dumpVMState/closure-дерева
 	for _, fn in ipairs(deepF) do S.seedFromFunction(fn) end
 	pcall(S.buildClosureTree, deepF)
+	-- ВЫЖИМАЛКА: строки из живых регистров + константы функций — каждый проход
+	local okH, gotH = pcall(S.harvestLive)
+	if okH and type(gotH) == "number" and gotH > 0 then
+		S.log("harvestLive: +" .. gotH .. " strings (total " .. #S.mainStrings .. ")")
+	end
 	pcall(S.flushDecrypted)
 	-- ECR по всем бинарным chunk'ам (повторно безопасно: перезаписывает тем же)
 	for _, c in ipairs(S.chunks or {}) do
 		if c.binary and c.raw then pcall(S.tryEcrOnBinary, c.ecrBase, c.raw) end
 	end
+	S.poolIndex = nil -- пулы обновились: индекс перестроить при сборке FULL
 	pcall(S.buildFullDeobfuscated)
 	if #S.structIndex > 0 then
 		S.save("structures_index.txt", table.concat(S.structIndex, "\n") .. "\n")
