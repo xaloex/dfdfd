@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -869,23 +869,24 @@ local function installShims()
 	if type(rawget(_G, "getexecutorname")) ~= "function" then
 		applyShim("getexecutorname", function() return "Profes" end)
 	end
-	if type(rawget(_G, "hookfunction")) ~= "function" then
+	local realHookFn = (type(hookfunction) == "function" and hookfunction) or rawget(genv, "hookfunction") or rawget(_G, "hookfunction")
+	if type(realHookFn) ~= "function" then
 		applyShim("hookfunction", function(target, repl)
-			if type(target) == "table" and type(repl) == "function" then
-				pcall(rawset, target, "__profesHook", true)
-			end
 			return function() end
 		end)
 		S.shims.hookfunction = "created (no-op)"
 	end
-	if type(rawget(_G, "getgc")) ~= "function" then
+	local realGetgc = (type(getgc) == "function" and getgc) or rawget(genv, "getgc") or rawget(_G, "getgc")
+	if type(realGetgc) ~= "function" then
 		applyShim("getgc", function() return {} end)
 	end
 
-	local existingBuf = rawget(_G, "buffer")
+	local existingBuf = (type(buffer) == "table" and buffer) or rawget(genv, "buffer") or rawget(_G, "buffer")
 	if type(existingBuf) ~= "table" and type(existingBuf) ~= "userdata" then
 		applyShim("buffer", makeBufferShim())
 		S.shims.buffer = "created (pure-Lua byte buffer, single cursor)"
+	else
+		S.shims.buffer = "native"
 	end
 end
 
@@ -1606,12 +1607,21 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	else
 		S.save(base .. ".lua", src)
 		S.log("#" .. n .. " TEXT (" .. #src .. " chars) -> " .. base .. ".lua")
-		-- МГНОВЕННЫЙ ФАЙЛ: копия целевого чанка как 00_READY.lua — один файл,
-		-- сразу, без каталога. Это максимум "настоящего скрипта", который VM
-		-- отдаёт наружу: дальше исходника в открытом виде нет, только VM-таблицы.
+		local isObf = src:find("Luraph", 1, true)
+			or src:find("LPH", 1, true)
+			or src:find("Luarmor", 1, true)
+			or src:find("Moonsec", 1, true)
+			or src:find("IronBrew", 1, true)
+			or src:sub(1, 4) == "\27Lua"
+
 		if S.armed ~= false then
-			S.save("00_READY.lua", src)
-			S.log("READY written: 00_READY.lua (" .. #src .. " chars)")
+			if isObf then
+				S.save("00_RAW_OBFUSCATED_INPUT.lua", src)
+				S.log("TARGET IS OBFUSCATED (VM). Raw saved to 00_RAW_OBFUSCATED_INPUT.lua")
+			else
+				S.save("00_READY_CLEAN.lua", src)
+				S.log("READY written: 00_READY_CLEAN.lua (" .. #src .. " chars)")
+			end
 		end
 
 		if not S.cfg.quiet and S.cfg.analyze then
@@ -1623,14 +1633,14 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 				S.save("blobs/" .. base .. "_blob" .. k .. ".txt", bl)
 			end
 			local declared = declaredNames(src)
-			local called, other = {}, {}
+			local called, other = markSelf({}), markSelf({})
 			for _, r in ipairs(names) do
 				if not declared[r.name] and not globalExists(r.name) then
 					if r.called then called[#called + 1] = r else other[#other + 1] = r end
 				end
 			end
 			if #called > 0 or #other > 0 then
-				local out = {}
+				local out = markSelf({})
 				out[#out + 1] = "=== " .. base .. " ==="
 				if #called > 0 then
 					out[#out + 1] = ">>> CALLED BUT MISSING (" .. #called .. "):"
@@ -1644,7 +1654,7 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 					for _, r in ipairs(other) do nm[#nm + 1] = r.name end
 					out[#out + 1] = "--- referenced only (" .. #other .. "): " .. table.concat(nm, ", ")
 				end
-				S.missingOut = S.missingOut or {}
+				S.missingOut = S.missingOut or markSelf({})
 				for _, l in ipairs(out) do S.missingOut[#S.missingOut + 1] = l end
 				S.save("missing_globals.txt", table.concat(S.missingOut, "\n") .. "\n")
 				local cn = {}
@@ -1660,8 +1670,11 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 					S.save(base .. ".pretty.lua", pretty)
 					S.log("#" .. n .. " formatted -> " .. base .. ".pretty.lua")
 					if S.armed ~= false then
-						S.save("00_READY.pretty.lua", pretty)
-						S.log("READY written: 00_READY.pretty.lua")
+						if isObf then
+							S.save("00_RAW_OBFUSCATED_INPUT.pretty.lua", pretty)
+						else
+							S.save("00_READY_CLEAN.pretty.lua", pretty)
+						end
 					end
 					-- форматирование не ломает поток токенов, но исходник мог быть
 					-- битым изначально — проверяем и чиним
@@ -3514,6 +3527,7 @@ function S.buildFullDeobfuscated(force)
 		nPool, nProto, nInstr, nState, #S.decrypted)
 	local text = table.concat(L, "\n") .. "\n"
 	S.save("main/FULL_DEOBFUSCATED.lua", text)
+	S.save("00_DEOBFUSCATED_DUMP.lua", text)
 	-- валидация собранного файла оригинальным компилятором
 	if S.cfg.fixSyntax then pcall(S.ensureValid, "main/FULL_DEOBFUSCATED", text, "lua") end
 	S.log(string.format("FULL_DEOBFUSCATED written: %d bytes pools=%d protos=%d instr=%d",
