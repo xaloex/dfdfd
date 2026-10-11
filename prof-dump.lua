@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES  —  дампер структур VM Luraph (runtime, а не только компиляция)
+    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -15,7 +15,7 @@
     Его интерпретирует сама VM. Поэтому хук loadstring даёт только внешний
     зашифрованный слой, а исходника игры в нём нет.
 
-    ЧТО ЭТОТ ДАМПЕР ДЕЛАЕТ
+    ЧТО ЭТОТ ДАМПЕР ДЕЛАЕТ (v2 BRUTAL — новое помечено [NEW])
     ---------------------
     1) Перехват внешнего слоя (loadstring / load / HttpGet / request) + шимы,
        без которых VM вообще не стартует: bit32 (+countlz/countrz), buffer,
@@ -32,11 +32,34 @@
        плюс константы каждого обработчика и linedefined, чтобы сопоставить
        номер опкода со строкой в .pretty.lua.
     5) Периодические свипы: структуры появляются по мере работы десериализатора.
+    6) [NEW] ГЛУБОКИЙ ОБХОД ПАМЯТИ: getgc(includeTables) + getrenv +
+       рекурсия по upvalue до глубины 8 + обход _G/getgenv/shared/registry.
+       Цепляет зашифрованные blob-строки (>512 байт) и вложенные VM-таблицы,
+       которые мелкий обход (depth 2) не видел.
+    7) [NEW] РЕКОНСТРУКТОР ГЛАВНОГО СКРИПТА: из Constant Pool + Proto Table +
+       Instruction Array + closure-дерева собирает ОДИН читаемый файл
+       main/FULL_DEOBFUSCATED.lua — максимально близкий к исходнику:
+       константы с индексами, функции-прототипы с их константами/upvalue,
+       псевдокод инструкций через карту опкодов, живые регистры, все строки.
+    8) [NEW] ЖИВОЙ ПЕРЕХВАТ ДИСПЕТЧЕРА: хуки на string.byte/char/sub +
+       table.insert/concat/remove фиксируют момент расшифровки констант в
+       рантайме и складывают в main/DECRYPTED_CONSTANTS.txt. Это те строки,
+       которых НЕТ в статическом пуле — они появляются только при исполнении.
+    9) [NEW] ECR/BYTECODE-декодеры: "\27LUA"-контейнеры и EOR-поток
+       автоматически расшифровываются в .ecr.lua рядом с бинарником.
 
     ВАЖНО: ничего в таблицах payload'а не меняется — только чтение. Иначе
-    сработает self-integrity check из anti-tamper слоя.
+    сработает self-integrity check из anti-tamper слоя. Единственное место
+    с записью — опциональный traceCalls (по умолчанию ВЫКЛ).
 
     КУДА: workspace/Profes-Dump/<дата_время>/
+        chunk_*.lua / .pretty.lua     — внешний зашифрованный слой (VM)
+        structures/                   — сырые структуры VM по видам
+        main/FULL_DEOBFUSCATED.lua    — [NEW] ГЛАВНЫЙ СКРИПТ, весь, читаемый
+        main/ALL_MAIN_STRINGS.txt     — все строки программы с частотой
+        main/DECRYPTED_CONSTANTS.txt  — [NEW] строки, расшифрованные при работе
+        main/closure_tree.txt         — дерево прототипов из getprotos
+        opcodes.txt                   — карта опкодов диспетчера
 ══════════════════════════════════════════════════════════════════════════]]
 
 ---------------------------------------------------------------------------
@@ -67,6 +90,22 @@ end
 local userCfg = rawget(genv, "PROFES_CFG")
 if type(userCfg) ~= "table" then userCfg = {} end
 
+-- ОРИГИНАЛЬНЫЙ компилятор: берём ДО установки хуков. Через перехваченный
+-- load проверять синтаксис нельзя — каждая проверка попала бы в onChunk
+-- и засоряла папку фиктивными chunk'ами.
+local function pickOrig()
+	local a = rawget(genv, "load")
+	if type(a) == "function" then return a end
+	a = rawget(_G, "load")
+	if type(a) == "function" then return a end
+	a = rawget(genv, "loadstring")
+	if type(a) == "function" then return a end
+	a = rawget(_G, "loadstring")
+	if type(a) == "function" then return a end
+	return nil
+end
+local ORIG_COMPILER = pickOrig()
+
 local S = {
 	active = true,
 	dir = nil,
@@ -74,15 +113,28 @@ local S = {
 		format = userCfg.format ~= false,
 		breakTables = userCfg.breakTables ~= false,
 		analyze = userCfg.analyze ~= false,
+		fixSyntax = userCfg.fixSyntax ~= false,   -- проверка + починка синтаксиса
+		salvage = userCfg.salvage ~= false,       -- обрезка до целой конструкции
 		hookHttp = userCfg.hookHttp ~= false,
 		hookRemotes = userCfg.hookRemotes ~= false,
 		walkChunk = userCfg.walkChunk ~= false,
 		structures = userCfg.structures ~= false,
+		mobile = userCfg.mobile ~= false,            -- [MOBILE] режим слабых экзекуторов
+		mobilePoll = userCfg.mobilePoll or 1.5,      -- [MOBILE] интервал опроса памяти (сек)
+		mobileSweeps = userCfg.mobileSweeps or 40,   -- [MOBILE] сколько опросов держать
+		safeHooks = userCfg.safeHooks ~= false,      -- [MOBILE] хуки только через pcall
 		minTableSize = userCfg.minTableSize or 16,   -- порог "интересной" таблицы
 		maxDumpStrings = userCfg.maxDumpStrings or 20000,
 		maxDumpInstr = userCfg.maxDumpInstr or 60000,
-		sweepDelays = userCfg.sweepDelays or { 2, 5, 10, 20 },
+		sweepDelays = userCfg.sweepDelays or { 2, 5, 10, 20, 40, 60 },
 		traceCalls = userCfg.traceCalls == true,     -- по умолчанию выкл: рискованно
+		brutal = userCfg.brutal ~= false,            -- [NEW] глубокий обход + реконструктор
+		deepDepth = userCfg.deepDepth or 8,          -- [NEW] глубина рекурсии по upvalue
+		blobMin = userCfg.blobMin or 512,            -- [NEW] порог "зашифрованный blob"
+		liveDecrypt = userCfg.liveDecrypt ~= false,  -- [NEW] перехват расшифровки констант
+		ecr = userCfg.ecr ~= false,                  -- [NEW] авто-расшифровка ECR-контейнеров
+		maxDeepTables = userCfg.maxDeepTables or 60000,
+		maxFns = userCfg.maxFns or 60000,
 		verbose = userCfg.verbose ~= false,
 	},
 	chunks = {},
@@ -91,6 +143,13 @@ local S = {
 	structs = {},        -- уже выгруженные таблицы (по адресу-строке)
 	scanned = 0,
 	sweepCount = 0,
+	blobs = {},            -- [NEW] зашифрованные blob-строки из памяти
+	decrypted = {},        -- [NEW] константы, пойманные живой расшифровкой
+	decryptedSeen = {},
+	closureTree = {},      -- [NEW] дерево прототипов getprotos
+	ecrInfo = {},           -- [NEW] результаты ECR-декода
+	deepCount = 0,
+	fnCount = 0,
 	remoteLog = {},
 	remHooked = {},
 	remBase = {},
@@ -156,6 +215,109 @@ S.dir = ROOT_DIR .. "/" .. os.date("%Y-%m-%d_%H-%M-%S")
 makeDir(S.dir)
 print("[Profes] folder: workspace/" .. S.dir)
 if not S.hasWrite then print("[Profes] WARNING: no writefile - nowhere to save!") end
+
+---------------------------------------------------------------------------
+-- 1.5 MOBILE: детект возможностей экзекутора (iOS/Android урезаны)
+--     Проверяем КАЖДУЮ функцию отдельно: на мобиле часто нет getgc,
+--     getprotos, getconstants, hookmetamethod, newcclosure. Дампер обязан
+--     работать на голом минимуме: loadstring + writefile + debug.
+---------------------------------------------------------------------------
+S.cap = {}
+local function hasFn(holder, name)
+	local v = holder and rawget(holder, name)
+	return type(v) == "function"
+end
+local function probeAPI()
+	local caps = S.cap
+	caps.writefile = type(writefile) == "function"
+	caps.makefolder = type(makefolder) == "function"
+	caps.getgc = hasFn(genv, "getgc") or hasFn(_G, "getgc")
+	caps.getprotos = hasFn(genv, "getprotos") or hasFn(_G, "getprotos")
+	caps.getconstants = hasFn(genv, "getconstants") or hasFn(_G, "getconstants")
+	caps.getupvalues = hasFn(genv, "getupvalues") or hasFn(_G, "getupvalues")
+	caps.getupvalue = hasFn(genv, "getupvalue") or hasFn(_G, "getupvalue")
+	caps.getconstant = hasFn(genv, "getconstant") or hasFn(_G, "getconstant")
+	caps.hookmetamethod = type(hookmetamethod) == "function"
+	caps.newcclosure = type(newcclosure) == "function"
+	caps.hookfunction = type(hookfunction) == "function"
+	caps.getrenv = type(getrenv) == "function"
+	caps.getregistry = type(getregistry) == "function"
+	caps.stringdump = type(string.dump) == "function"
+	caps.taskspawn = type(task) == "table" and type(task.spawn) == "function"
+	caps.taskdelay = type(task) == "table" and type(task.delay) == "function"
+	caps.debug_getinfo = type(debug) == "table" and type(debug.getinfo) == "function"
+	caps.debug_getupvalue = type(debug) == "table" and type(debug.getupvalue) == "function"
+	-- debug.getupvalue — штатный фолбэк, когда нет executor-getupvalues
+	caps.canUpvals = caps.getupvalues or caps.debug_getupvalue
+	caps.mobile = not (caps.getgc and caps.getprotos and caps.getconstants)
+	return caps
+end
+probeAPI()
+
+-- Единая обёртка чтения upvalue: executor-API -> debug.getupvalue -> пусто.
+-- На мобиле чаще всего жив только debug-вариант.
+local function readUpvalues(fn)
+	local gu = rawget(genv, "getupvalues") or rawget(_G, "getupvalues")
+	if type(gu) == "function" then
+		local ok, uvs = pcall(gu, fn)
+		if ok and type(uvs) == "table" then return uvs end
+	end
+	if type(debug) == "table" and type(debug.getupvalue) == "function" then
+		local out = {}
+		local i = 1
+		while true do
+			local ok, name, val = pcall(debug.getupvalue, fn, i)
+			if not ok or name == nil then break end
+			out[name or i] = val
+			i = i + 1
+			if i > 256 then break end
+		end
+		return out
+	end
+	return nil
+end
+
+-- Единое чтение констант: getconstants -> getconstant по индексу -> пусто.
+local function readConstants(fn)
+	local gc = rawget(genv, "getconstants") or rawget(_G, "getconstants")
+	if type(gc) == "function" then
+		local ok, cs = pcall(gc, fn)
+		if ok and type(cs) == "table" then return cs end
+	end
+	local gi = rawget(genv, "getconstant") or rawget(_G, "getconstant")
+	if type(gi) == "function" then
+		local out = {}
+		for i = 1, 512 do
+			local ok, v = pcall(gi, fn, i)
+			if not ok or v == nil then break end
+			out[#out + 1] = v
+		end
+		if #out > 0 then return out end
+	end
+	return nil
+end
+
+-- Единое чтение проtos: getprotos -> debug.getproto (Solara/others) -> пусто.
+local function readProtos(fn)
+	local gp = rawget(genv, "getprotos") or rawget(_G, "getprotos")
+	if type(gp) == "function" then
+		local ok, ps = pcall(gp, fn)
+		if ok and type(ps) == "table" then return ps end
+	end
+	if type(debug) == "table" and type(debug.getproto) == "function" then
+		local out = {}
+		local i = 1
+		while true do
+			local ok, p = pcall(debug.getproto, fn, i)
+			if not ok or type(p) ~= "function" then break end
+			out[#out + 1] = p
+			i = i + 1
+			if i > 512 then break end
+		end
+		if #out > 0 then return out end
+	end
+	return nil
+end
 
 ---------------------------------------------------------------------------
 -- 2. УТИЛИТЫ
@@ -1007,9 +1169,11 @@ local function formatLua(src)
 			i = i + 1
 
 		elseif c == "," then
+			-- состояние выставляем ДО nl(): иначе перезапишем его (atStart/prev)
+			-- и следующий токен получит лишний пробел
+			atStart, prev, prevWord = false, ",", ""
 			put(",")
 			if S.cfg.breakTables and top() == "{" then nl() end
-			atStart, prev, prevWord = false, ",", ""
 			i = i + 1
 
 		elseif c == "(" then
@@ -1045,7 +1209,11 @@ local function formatLua(src)
 			i = i + 1
 
 		elseif c == ";" then
-			nl()
+			-- перенос только если дальше есть код: иначе ";" в конце файла
+			-- добавлял бы пустую строку при каждом повторном проходе
+			local j = i + 1
+			while j <= total and src:sub(j, j):match("%s") do j = j + 1 end
+			if j <= total then nl() end
 			i = i + 1
 
 		elseif c:match("%s") then
@@ -1256,7 +1424,8 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 
 	local base = "chunk_" .. string.format("%03d", n) .. "_" .. tag .. "_" .. h
 	S.chunks[#S.chunks + 1] = { n = n, tag = tag, size = #src, name = base,
-		binary = isBinary(src), chunkname = tostring(chunkname) }
+		binary = isBinary(src), chunkname = tostring(chunkname),
+		raw = isBinary(src) and src or nil, ecrBase = base }
 
 	if isBinary(src) then
 		S.saveRaw(base .. ".bin", src)
@@ -1265,6 +1434,8 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 			.. ")\n-- size: " .. #src .. "\n-- isECR: " .. tostring(src:sub(1, 4) == "\27LUA")
 			.. "\n-- HEX:\n" .. hexDump(src, 96) .. "\n")
 		S.log("#" .. n .. " BINARY (" .. #src .. " bytes) -> " .. base .. ".bin")
+		-- ECR сразу: мобиле некогда ждать повторного свипа
+		pcall(S.tryEcrOnBinary, base, src)
 	else
 		S.save(base .. ".lua", src)
 		S.log("#" .. n .. " TEXT (" .. #src .. " chars) -> " .. base .. ".lua")
@@ -1314,12 +1485,22 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 				if okF and type(pretty) == "string" and #pretty > 0 then
 					S.save(base .. ".pretty.lua", pretty)
 					S.log("#" .. n .. " formatted -> " .. base .. ".pretty.lua")
+					-- форматирование не ломает поток токенов, но исходник мог быть
+					-- битым изначально — проверяем и чиним
+					if S.cfg.fixSyntax then pcall(S.ensureValid, base, pretty, "pretty") end
 					pcall(S.scheduleScan)
 				else
 					S.log("formatter failed on #" .. n .. ": " .. tostring(pretty))
 				end
 			end
 			if type(task) == "table" and type(task.spawn) == "function" then task.spawn(job) else job() end
+		elseif S.cfg.fixSyntax then
+			pcall(S.ensureValid, base, src, "raw")
+		end
+
+		-- исходник проверяем всегда: даже если форматирование выключено
+		if S.cfg.fixSyntax and S.cfg.format then
+			pcall(S.ensureValid, base, src, "raw")
 		end
 	end
 
@@ -1353,6 +1534,8 @@ local function taddr(t) return tostring(t) end
 -- Собираем кандидатов: getgc, если есть, иначе рекурсивно по upvalue
 local function collectTables()
 	local seen, out = {}, {}
+	local visitedFn = {}
+
 	local function add(t)
 		local a = taddr(t)
 		if not seen[a] then
@@ -1361,27 +1544,35 @@ local function collectTables()
 		end
 	end
 
-	local getgcFn = rawget(genv, "getgc") or rawget(_G, "getgc")
-	if type(getgcFn) == "function" then
-		local ok, res = pcall(getgcFn, true)
-		if ok and type(res) == "table" then
-			for _, v in ipairs(res) do
-				if type(v) == "table" then add(v) end
+	-- функции-перехватчики объявляются заранее, иначе walkFn увидит
+	-- walkFn2 как nil (upvalue ещё не присвоен) и упадёт
+	local walkFn2, walkFn
+
+	-- обход таблиц, встречающихся внутри upvalue
+	walkFn2 = function(t, depth)
+		if depth > 2 then return end
+		local ok, iter = pcall(pairs, t)
+		if not ok or type(iter) ~= "function" then return end
+		for _, v in pairs(t) do
+			if type(v) == "table" then
+				add(v)
+				walkFn2(v, depth + 1)
+			elseif type(v) == "function" then
+				walkFn(v, depth + 1)
 			end
 		end
 	end
 
-	-- вторая опора: всё, что лежит в upvalue функций перехваченных chunk'ов
-	local getupval = rawget(genv, "getupvalues") or rawget(_G, "getupvalues")
-	if type(getupval) == "function" then
-		local visited = {}
-		local function walkFn(fn, depth)
-			if type(fn) ~= "function" or depth > 6 then return end
-			local key = taddr(fn)
-			if visited[key] then return end
-			visited[key] = true
-			local ok, uvs = pcall(getupval, fn)
-			if ok and type(uvs) == "table" then
+	-- обход функций: их upvalue + собственные поля (наш хук держит orig в поле)
+	walkFn = function(fn, depth)
+		if type(fn) ~= "function" or depth > 6 then return end
+		local key = taddr(fn)
+		if visitedFn[key] then return end
+		visitedFn[key] = true
+
+		do
+			local uvs = readUpvalues(fn)
+			if type(uvs) == "table" then
 				for _, uv in pairs(uvs) do
 					if type(uv) == "table" then
 						add(uv)
@@ -1392,20 +1583,40 @@ local function collectTables()
 				end
 			end
 		end
-		local depthLimit = 2
-		local function walkFn2(t, depth)
-			if depth > depthLimit then return end
-			for _, v in pairs(t) do
+
+		-- поля функции: __profesBase указывает на оригинал, если мы обернули
+		for _, field in ipairs({"__profesBase", "__profesHook"}) do
+			local ok2, v = pcall(function() return fn[field] end)
+			if ok2 and type(v) == "table" then
+				add(v)
+				walkFn2(v, 0)
+			end
+		end
+	end
+
+	local getgcFn = rawget(genv, "getgc") or rawget(_G, "getgc")
+	if type(getgcFn) == "function" then
+		local ok, res = pcall(getgcFn, true)
+		if ok and type(res) == "table" then
+			for _, v in ipairs(res) do
 				if type(v) == "table" then
 					add(v)
-					walkFn2(v, depth + 1)
+					walkFn2(v, 0)
 				elseif type(v) == "function" then
-					walkFn(v, depth + 1)
+					walkFn(v, 0)
 				end
 			end
 		end
-		for _, fn in ipairs(S.chunkFns or {}) do walkFn(fn, 0) end
 	end
+
+	-- наши собственные перехватчики: через них лежит оригинальный loadstring
+	for _, name in ipairs({"loadstring", "load"}) do
+		local h = rawget(genv, name) or rawget(_G, name)
+		if type(h) == "function" then walkFn(h, 0) end
+	end
+
+	for _, fn in ipairs(S.chunkFns or {}) do walkFn(fn, 0) end
+	for _, fn in ipairs(S.seenFns or {}) do walkFn(fn, 0) end
 	return out
 end
 
@@ -1445,24 +1656,35 @@ local function classify(t)
 	end
 
 	local total = numKeys + strKeys
+	-- доля занятых числовых слотов: плотно (1..N) — список прототипов,
+	-- разреженно (31,32,37,80) — карта опкодов
+	local density = (maxNum > 0) and (numKeys / maxNum) or 0
 	local kind, why
+
+	-- Пороги пропорциональные, а не фиксированные: иначе таблицы меньше
+	-- 8 элементов никогда не опознаются (проверено тестом).
 	if total == 0 then
 		kind = "EMPTY"
-	elseif strKeys == 0 and vStr >= math.max(8, total * 0.5) and numKeys >= S.cfg.minTableSize then
-		kind = "CONSTANT_POOL"
-		why = "числовые ключи + строковые значения"
-	elseif strKeys == 0 and vFn >= math.max(8, total * 0.5) then
-		kind = "DISPATCH_TABLE"
-		why = "числовые/строковые ключи -> функции (карта опкодов)"
-	elseif strKeys == 0 and nestedWithOps >= math.max(8, total * 0.4) then
+		why = "пусто"
+	elseif strKeys == 0 and vTbl >= math.max(3, total * 0.4) then
 		kind = "INSTRUCTION_ARRAY"
 		why = "массив вложенных таблиц (инструкции)"
-	elseif strKeys == 0 and vNum >= math.max(8, total * 0.6) then
+	elseif strKeys == 0 and vStr >= math.max(3, total * 0.4) then
+		kind = "CONSTANT_POOL"
+		why = "числовые ключи + строковые значения"
+	elseif strKeys == 0 and vFn >= math.max(3, total * 0.5) then
+		-- Proto Chunk Table и карта опкодов имеют ОДИНАКОВУЮ форму
+		-- (индекс -> функция), поэтому различаем только по плотности ключей
+		kind = "FUNC_TABLE"
+		why = (density > 0.75)
+			and "индексы -> функции, ключи плотные (похоже на Proto Chunk Table)"
+			or "индексы -> функции, ключи разреженные (похоже на карту опкодов)"
+	elseif strKeys == 0 and vNum >= math.max(3, total * 0.6) then
 		kind = "NUMERIC_POOL"
-		why = "массив чисел (возможно константы или распакованный байткод)"
-	elseif numKeys >= S.cfg.minTableSize and vFn > 0 then
-		kind = "PROTO_TABLE"
-		why = "много функций по индексам (прототипы)"
+		why = "массив чисел (константы или распакованный байткод)"
+	elseif strKeys > 0 and numKeys >= 4 and vFn == 0 and vTbl == 0 then
+		kind = "REGISTERS"
+		why = "числовые слоты + именованные поля (virtual registers / call stack)"
 	elseif total >= S.cfg.minTableSize then
 		kind = "MIXED_TABLE"
 		why = "смешанная таблица"
@@ -1474,6 +1696,7 @@ local function classify(t)
 	return {
 		total = total, numKeys = numKeys, strKeys = strKeys, maxNum = maxNum,
 		vNum = vNum, vStr = vStr, vFn = vFn, vTbl = vTbl, vBool = vBool,
+		density = density, nestedWithOps = nestedWithOps,
 		kind = kind, why = why, strSamples = strSamples, fnKeys = fnKeys,
 	}
 end
@@ -1574,8 +1797,7 @@ local function dumpStructure(idx, t, st)
 	end
 
 	-- Proto Table: список функций с их константами
-	if st.kind == "PROTO_TABLE" or st.kind == "DISPATCH_TABLE" then
-		local getconst = rawget(genv, "getconstants") or rawget(_G, "getconstants")
+	if st.kind == "FUNC_TABLE" then
 		local keys = {}
 		for k in pairs(t) do keys[#keys + 1] = k end
 		table.sort(keys, function(a, b)
@@ -1594,9 +1816,9 @@ local function dumpStructure(idx, t, st)
 					pcall(function() info = debug.getinfo(v, "S") or {} end)
 				end
 				local consts = {}
-				if type(getconst) == "function" then
-					local cok, cs = pcall(getconst, v)
-					if cok and type(cs) == "table" then
+				do
+					local cs = readConstants(v)
+					if type(cs) == "table" then
 						for _, c in pairs(cs) do
 							if type(c) == "string" and #c > 1 then consts[#consts + 1] = c end
 							if #consts >= 10 then break end
@@ -1612,7 +1834,7 @@ local function dumpStructure(idx, t, st)
 					out[#out + 1] = "        consts: " .. table.concat(consts, " | ")
 				end
 				-- карта опкодов
-				if st.kind == "DISPATCH_TABLE" and type(k) == "number" then
+				if st.kind == "FUNC_TABLE" and type(k) == "number" then
 					S.opcodeOut[#S.opcodeOut + 1] = string.format(
 						"0x%02X (%d)  line %-6s  %-14s consts: %s",
 						k % 256, k, tostring(info.linedefined or "?"), label,
@@ -1639,6 +1861,8 @@ function S.scanStructures()
 				S.scanned = S.scanned + 1
 				found = found + 1
 				pcall(dumpStructure, S.scanned, t, st)
+				-- запоминаем структуру для выгрузки MAIN-скрипта
+				S.mainStructs[#S.mainStructs + 1] = { t = t, kind = st.kind, stat = st }
 			elseif ok and st then
 				S.structs[a] = st
 			end
@@ -1656,8 +1880,52 @@ function S.scanStructures()
 		}
 		S.save("opcodes.txt", table.concat(head, "\n") .. table.concat(S.opcodeOut, "\n") .. "\n")
 	end
+	-- MAIN-СКРИПТ: Constant Pool / Instruction Array / Proto Table из рантайма
+	pcall(S.dumpMain)
+	pcall(S.dumpVMState)
+	pcall(S.brutalScan)
 	S.log("scan #" .. S.sweepCount .. ": tables=" .. #tables .. " new structures=" .. found)
 	return found
+end
+
+-- MOBILE-ПОЛЛЕР: на слабых экзекуторах task.delay может отсутствовать или
+-- VM строит структуры поздно. Крутим опрос N раз с интервалом: каждый проход
+-- делает scanStructures + brutalScan + flush. Останавливается сам.
+function S.startMobilePoller()
+	if S.pollerStarted then return end
+	S.pollerStarted = true
+	local interval = S.cfg.mobilePoll or 1.5
+	local total = S.cfg.mobileSweeps or 40
+	S.log(string.format("mobile poller: %d sweeps every %.1fs (caps: getgc=%s protos=%s consts=%s upvals=%s dump=%s)",
+		total, interval, tostring(S.cap.getgc), tostring(S.cap.getprotos),
+		tostring(S.cap.getconstants), tostring(S.cap.canUpvals), tostring(S.cap.stringdump)))
+	local count = 0
+	local function one()
+		count = count + 1
+		pcall(S.scanStructures)
+		pcall(S.flushDecrypted)
+		pcall(S.flush)
+		pcall(S.flushFixes)
+		if count < total then
+			if type(task) == "table" and type(task.delay) == "function" then
+				task.delay(interval, one)
+			elseif type(delay) == "function" then
+				delay(interval, one)
+			elseif type(wait) == "function" then
+				pcall(wait, interval)
+				one()
+			end
+		else
+			S.log("mobile poller done: " .. count .. " sweeps")
+		end
+	end
+	if type(task) == "table" and type(task.spawn) == "function" then
+		task.spawn(function()
+			if type(task.delay) == "function" then task.delay(interval, one) else one() end
+		end)
+	else
+		one()
+	end
 end
 
 -- VM строит структуры по ходу работы, поэтому сканируем несколько раз
@@ -1686,9 +1954,1214 @@ end
 
 -- функции перехваченных chunk'ов — точка входа для обхода upvalue
 S.chunkFns = {}
+S.seenFns = {}
+S.seenFnMap = {}
 function S.seedFromFunction(fn)
 	if type(fn) ~= "function" then return end
 	S.chunkFns[#S.chunkFns + 1] = fn
+	local k = tostring(fn)
+	if not S.seenFnMap[k] then
+		S.seenFnMap[k] = true
+		S.seenFns[#S.seenFns + 1] = fn
+	end
+end
+
+---------------------------------------------------------------------------
+-- 10.5 MAIN-СКРИПТ: собираем всё, что VM держит в рантайме
+--      Из расшифрованной программы в живом состоянии можно вытащить:
+--        - Constant Pool      -> все строки/числа игры (имена методов, URL, GUI)
+--        - Instruction Array  -> сами инструкции (опкоды рандомизированы)
+--        - Proto Chunk Table  -> список функций программы
+--        - живое состояние    -> virtual registers / call stack
+--      Плюс перехват вызовов: какие функции и с какими аргументами зовёт игра.
+---------------------------------------------------------------------------
+S.mainStrings = {}
+S.mainStructs = {}
+S.callLog = {}
+
+local function vstr(v, cap)
+	v = tostring(v)
+	cap = cap or 120
+	if #v > cap then return v:sub(1, cap) .. "..." end
+	return v
+end
+
+-- все строки из всех структур, с частотой (главный интеллектуальный выход)
+local function harvestStrings(t, out, depth, cap)
+	if depth > 4 or #out > S.cfg.maxDumpStrings then return end
+	for _, v in pairs(t) do
+		local tv = type(v)
+		if tv == "string" then
+			if #v > 1 then
+				out[#out + 1] = v
+			end
+		elseif tv == "table" then
+			harvestStrings(v, out, depth + 1, cap)
+		end
+	end
+end
+
+local function dumpFreq(entries, path, title)
+	if #entries == 0 then return end
+	local freq = {}
+	for _, s in ipairs(entries) do
+		freq[s] = (freq[s] or 0) + 1
+	end
+	local keys = {}
+	for k in pairs(freq) do keys[#keys + 1] = k end
+	table.sort(keys, function(a, b)
+		local fa, fb = freq[a], freq[b]
+		if fa ~= fb then return fa > fb end
+		return a < b
+	end)
+	local out = { "-- " .. title .. " (" .. #keys .. " unique / " .. #entries .. " total)" }
+	local n = 0
+	for _, k in ipairs(keys) do
+		if n >= S.cfg.maxDumpStrings then
+			out[#out + 1] = "<< truncated >>"
+			break
+		end
+		out[#out + 1] = string.format("%-6d %q", freq[k], k)
+		n = n + 1
+	end
+	S.save(path, table.concat(out, "\n") .. "\n")
+end
+
+-- Constant Pool -> main/const_pool.txt (порядок как в VM, это важно для чтения)
+local function dumpConstPool(t, name)
+	local idxs = {}
+	for k in pairs(t) do
+		if type(k) == "number" then idxs[#idxs + 1] = k end
+	end
+	table.sort(idxs)
+	local out = {
+		"=== CONSTANT POOL / STRING TABLE [" .. name .. "] ===",
+		"Индексы совпадают с теми, что использует GETGLOBAL/SETGLOBAL в VM.",
+		"",
+	}
+	local strs = {}
+	for _, k in ipairs(idxs) do
+		local v = t[k]
+		local tv = type(v)
+		if tv == "string" then
+			out[#out + 1] = string.format("[%d] = %q", k, v)
+			if #v > 1 then strs[#strs + 1] = v end
+		elseif tv == "number" or tv == "boolean" then
+			out[#out + 1] = string.format("[%d] = %s", k, tostring(v))
+		else
+			out[#out + 1] = string.format("[%d] = <%s>", k, tv)
+		end
+	end
+	-- строковые ключи, если есть
+	local skeys = {}
+	for k in pairs(t) do
+		if type(k) == "string" then skeys[#skeys + 1] = k end
+	end
+	if #skeys > 0 then
+		table.sort(skeys)
+		out[#out + 1] = ""
+		out[#out + 1] = "-- string keys:"
+		for _, k in ipairs(skeys) do
+			local v = t[k]
+			if type(v) == "string" then
+				out[#out + 1] = string.format("%q = %q", k, v)
+				if #v > 1 then strs[#strs + 1] = v end
+			else
+				out[#out + 1] = string.format("%q = %s", k, vstr(v, 60))
+			end
+		end
+	end
+	S.save(name .. "_const_pool.txt", table.concat(out, "\n") .. "\n")
+	return strs
+end
+
+-- Instruction Array -> main/instructions.txt
+local function dumpInstructions(t, name)
+	local idxs = {}
+	for k in pairs(t) do
+		if type(k) == "number" then idxs[#idxs + 1] = k end
+	end
+	table.sort(idxs)
+	local out = {
+		"=== INSTRUCTION ARRAY [" .. name .. "] ===",
+		"Опкоды рандомизированы под сборку. Сопоставь первый элемент каждой",
+		"инструкции с opcodes.txt (там есть обработчик и его строка в VM).",
+		"",
+	}
+	for _, k in ipairs(idxs) do
+		if #out >= S.cfg.maxDumpInstr then
+			out[#out + 1] = "<< truncated at " .. S.cfg.maxDumpInstr .. " >>"
+			break
+		end
+		local v = t[k]
+		if type(v) == "table" then
+			local parts = {}
+			for kk, vv in pairs(v) do
+				parts[#parts + 1] = tostring(kk) .. "=" .. vstr(vv, 40)
+				if #parts >= 16 then break end
+			end
+			out[#out + 1] = string.format("[%d] { %s }", k, table.concat(parts, ", "))
+		else
+			out[#out + 1] = string.format("[%d] = %s", k, vstr(v, 80))
+		end
+	end
+	S.save(name .. "_instructions.txt", table.concat(out, "\n") .. "\n")
+end
+
+-- Proto Chunk Table -> main/protos.txt
+local function dumpProtos(t, name)
+	local keys = {}
+	for k in pairs(t) do keys[#keys + 1] = k end
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+	local out = { "=== PROTO CHUNK TABLE [" .. name .. "] (" .. #keys .. ") ===", "" }
+	local strs = {}
+	for _, k in ipairs(keys) do
+		local v = t[k]
+		if type(v) == "function" then
+			local info = {}
+			if type(debug) == "table" and type(debug.getinfo) == "function" then
+				pcall(function() info = debug.getinfo(v, "Su") or {} end)
+			end
+			out[#out + 1] = string.format("[%s]  nparams=%s isvararg=%s",
+				tostring(k), tostring(info.nparams or "?"), tostring(info.isvararg or "?"))
+			do
+				local cs = readConstants(v)
+				if type(cs) == "table" then
+					local parts = {}
+					for _, c in pairs(cs) do
+						local tc = type(c)
+						if tc == "string" and #c > 1 then
+							parts[#parts + 1] = string.format("%q", c:sub(1, 60))
+							strs[#strs + 1] = c
+						elseif tc == "number" or tc == "boolean" then
+							parts[#parts + 1] = tostring(c)
+						end
+						if #parts >= 40 then break end
+					end
+					if #parts > 0 then
+						out[#out + 1] = "   consts: " .. table.concat(parts, ", ")
+					end
+				end
+			end
+			do
+				local uvs = readUpvalues(v)
+				if type(uvs) == "table" then
+					local names = {}
+					for kk, uv in pairs(uvs) do
+						names[#names + 1] = tostring(kk) .. ":" .. type(uv)
+						if #names >= 20 then break end
+					end
+					if #names > 0 then
+						out[#out + 1] = "   upvals: " .. table.concat(names, ", ")
+					end
+				end
+			end
+		else
+			out[#out + 1] = string.format("[%s] = <%s> %s", tostring(k), type(v), vstr(v, 60))
+		end
+	end
+	S.save(name .. "_protos.txt", table.concat(out, "\n") .. "\n")
+	return strs
+end
+
+-- Живое состояние: virtual registers / call stack
+local function dumpRegisters(t, name)
+	local idxs = {}
+	for k in pairs(t) do
+		if type(k) == "number" then idxs[#idxs + 1] = k end
+	end
+	table.sort(idxs)
+	local out = { "=== LIVE STATE [" .. name .. "] (" .. #idxs .. " numeric slots) ===", "" }
+	for _, k in ipairs(idxs) do
+		if #out >= 4000 then out[#out + 1] = "<< truncated >>" break end
+		local v = t[k]
+		local tv = type(v)
+		if tv == "string" then
+			out[#out + 1] = string.format("R[%d] = %q", k, v:sub(1, 100))
+		elseif tv == "table" then
+			local parts = {}
+			for kk, vv in pairs(v) do
+				parts[#parts + 1] = tostring(kk) .. "=" .. vstr(vv, 30)
+				if #parts >= 8 then break end
+			end
+			out[#out + 1] = string.format("R[%d] = { %s }", k, table.concat(parts, ", "))
+		else
+			out[#out + 1] = string.format("R[%d] = %s", k, vstr(v, 80))
+		end
+	end
+	-- строковые ключи
+	local skeys = {}
+	for k in pairs(t) do
+		if type(k) == "string" then skeys[#skeys + 1] = k end
+	end
+	if #skeys > 0 then
+		table.sort(skeys)
+		out[#out + 1] = ""
+		out[#out + 1] = "-- named slots:"
+		for _, k in ipairs(skeys) do
+			out[#out + 1] = string.format("%s = %s", k, vstr(t[k], 80))
+		end
+	end
+	S.save(name .. "_state.txt", table.concat(out, "\n") .. "\n")
+end
+
+-- Перехват вызовов функций программы: показывает, что игра реально делает.
+-- Включается только при PROFES_CFG.traceCalls = true (identity-mетки VM
+-- могут сломаться, поэтому по умолчанию выключено).
+function S.installCallTracer(protos, name)
+	if not S.cfg.traceCalls then return end
+	local log = {}
+	for key, fn in pairs(protos) do
+		if type(fn) == "function" then
+			local real = fn
+			pcall(rawset, protos, key, function(...)
+				local parts = {}
+				for i = 1, select("#", ...) do
+					parts[#parts + 1] = vstr((select(i, ...)), 40)
+					if #parts >= 8 then break end
+				end
+				if #log < 5000 then
+					log[#log + 1] = string.format("%s(%s)", tostring(key), table.concat(parts, ", "))
+				end
+				return real(...)
+			end)
+		end
+	end
+	if #log > 0 then
+		S.save(name .. "_calls.txt", table.concat(log, "\n") .. "\n")
+	end
+end
+
+-- Собираем main из всех структур сразу
+function S.dumpMain()
+	if not S.cfg.structures then return 0 end
+	local found = 0
+	for idx, rec in ipairs(S.mainStructs) do
+		local t = rec.t
+		if t then
+			found = found + 1
+			local base = string.format("main/%03d_%s", idx, rec.kind)
+			if rec.kind == "CONSTANT_POOL" then
+				local strs = dumpConstPool(t, base)
+				for _, s in ipairs(strs) do S.mainStrings[#S.mainStrings + 1] = s end
+			elseif rec.kind == "INSTRUCTION_ARRAY" then
+				dumpInstructions(t, base)
+				harvestStrings(t, S.mainStrings, 1)
+			elseif rec.kind == "FUNC_TABLE" then
+				-- одна форма покрывает и Proto Chunk Table, и карту опкодов,
+				-- поэтому выгружаем оба среза
+				local strs = dumpProtos(t, base)
+				for _, s in ipairs(strs) do S.mainStrings[#S.mainStrings + 1] = s end
+			elseif rec.kind == "REGISTERS" then
+				dumpRegisters(t, base)
+				harvestStrings(t, S.mainStrings, 0)
+			elseif rec.kind == "NUMERIC_POOL" then
+				dumpInstructions(t, base)
+			elseif rec.kind == "MIXED_TABLE" then
+				local strs = dumpConstPool(t, base)
+				for _, s in ipairs(strs) do S.mainStrings[#S.mainStrings + 1] = s end
+				dumpInstructions(t, base)
+			else
+				harvestStrings(t, S.mainStrings, 0)
+			end
+			pcall(S.installCallTracer, t, base)
+		end
+	end
+	if #S.mainStrings > 0 then
+		dumpFreq(S.mainStrings, "main/ALL_MAIN_STRINGS.txt",
+			"ВСЕ СТРОКИ ИЗ СТРУКТУР VM (частота = сколько раз встречается)")
+		S.log("main strings harvested: " .. #S.mainStrings)
+	end
+	if found > 0 then S.log("main dump written for " .. found .. " structures") end
+	return found
+end
+
+-- Состояние виртуальных регистров самого интерпретатора (обычно большой upvalue)
+function S.dumpVMState()
+	local n = 0
+	local seen = {}
+	local function consider(fn, label, depth)
+		if depth > 3 or type(fn) ~= "function" then return end
+		local uvs = readUpvalues(fn)
+		if type(uvs) ~= "table" then return end
+		for i, uv in pairs(uvs) do
+			if type(uv) == "table" then
+				local a = taddr(uv)
+				if not seen[a] then
+					seen[a] = true
+					local okc, cnt = pcall(function()
+						local c = 0
+						for _ in pairs(uv) do c = c + 1 end
+						return c
+					end)
+					if okc and cnt >= S.cfg.minTableSize then
+						local ok2, st = pcall(classify, uv)
+						if ok2 and st then
+							local nm = string.format("%s_uv%d_%s", label, tostring(i), st.kind)
+							dumpRegisters(uv, nm)
+							n = n + 1
+						end
+					end
+				end
+			end
+		end
+	end
+	for _, fn in ipairs(S.seenFns or {}) do consider(fn, "vmfn", 0) end
+	S.log("VM state dumps: " .. n)
+	return n
+end
+
+---------------------------------------------------------------------------
+-- 10.6 ПОЧИНКА СИНТАКСИСА
+--      Перехваченные куски часто синтаксически битые: файл мог быть обрезан
+--      на середине, строка не закрыта, блок не до конца. Валидируем
+--      ОРИГИНАЛЬНЫМ компилятором (не нашим перехваченным load — иначе каждая
+--      проверка попадёт в onChunk) и чиним по типам ошибок.
+---------------------------------------------------------------------------
+local function validate(src)
+	local f = S.origCompiler or ORIG_COMPILER
+	if type(f) ~= "function" then return nil, "compiler unavailable" end
+	local ok, a, b = pcall(f, src, "=profes_check")
+	if not ok then return false, tostring(a) end
+	if a ~= nil then return true end
+	return false, tostring(b)
+end
+
+-- Баланс блоков/скобок вне строк и комментариев + последняя "безопасная" точка
+local function scanBalance(src)
+	local stack = {}
+	-- стек скобок: закрывать надо в ОБРАТНОМ порядке, иначе "f(g([3" ->
+	-- ")))" вместо корректного "])"
+	local bstack = {}
+	local openParen, openBrack, openBrace = 0, 0, 0
+	local unterminatedLong = nil
+	local unterminatedQuote = nil
+	local unterminatedQuotePos = nil
+	local lastSafe = 0
+	local i, n = 1, #src
+	local expectThenForElseif = false
+
+	local function skipStr(start)
+		local quote = src:sub(start, start)
+		local j = start + 1
+		while j <= n do
+			local ch = src:sub(j, j)
+			if ch == "\\" then
+				if src:sub(j + 1, j + 1):match("%d") then
+					local k = j + 1
+					while k <= n and k <= j + 3 and src:sub(k, k):match("%d") do k = k + 1 end
+					j = k
+				elseif src:sub(j + 1, j + 1) == "x" then
+					local k = j + 2
+					while k <= n and k <= j + 3 and src:sub(k, k):match("%x") do k = k + 1 end
+					j = k
+				else
+					j = j + 2
+				end
+			elseif ch == quote then return j + 1, true
+			elseif ch == "\n" then return j, false
+			else j = j + 1 end
+		end
+		return n + 1, false
+	end
+
+	while i <= n do
+		local c = src:sub(i, i)
+		if c == "-" and src:sub(i, i + 1) == "--" then
+			local lb = src:match("^%-%-%[(=*)%[", i)
+			if lb then
+				local close = "]" .. lb .. "]"
+				local e = src:find(close, i, true)
+				i = (e and e + #close) or (n + 1)
+			else
+				local e = src:find("\n", i, true)
+				i = (e and e + 1) or (n + 1)
+			end
+		elseif c == "[" and src:match("^%[(=*)%[", i) then
+			local lb = src:match("^%[(=*)%[", i)
+			local close = "]" .. lb .. "]"
+			local e = src:find(close, i, true)
+			if not e then
+				unterminatedLong = close
+				i = n + 1
+			else
+				i = e + #close
+			end
+		elseif c == '"' or c == "'" then
+			local j, closed = skipStr(i)
+			if not closed then
+				unterminatedQuote = c
+				unterminatedQuotePos = i
+			end
+			i = j
+		elseif c:match("[%a_]") then
+			local j = i
+			while j <= n and src:sub(j, j):match("[%w_]") do j = j + 1 end
+			local w = src:sub(i, j - 1)
+			if w == "function" or w == "do" or w == "repeat" then
+				stack[#stack + 1] = w
+			elseif w == "then" then
+				if expectThenForElseif then
+					expectThenForElseif = false
+				else
+					stack[#stack + 1] = "if"
+				end
+			elseif w == "if" or w == "while" or w == "for" then
+				expectThenForElseif = false
+			elseif w == "elseif" then
+				expectThenForElseif = true
+			elseif w == "end" or w == "until" then
+				table.remove(stack)
+				expectThenForElseif = false
+				if #stack == 0 and openParen == 0 and openBrack == 0 and openBrace == 0 then
+					lastSafe = j
+				end
+			end
+			i = j
+		elseif c == "(" then
+			openParen = openParen + 1
+			bstack[#bstack + 1] = ")"
+			i = i + 1
+		elseif c == ")" then
+			openParen = math.max(0, openParen - 1)
+			if #bstack > 0 then table.remove(bstack) end
+			i = i + 1
+		elseif c == "[" then
+			openBrack = openBrack + 1
+			bstack[#bstack + 1] = "]"
+			i = i + 1
+		elseif c == "]" then
+			openBrack = math.max(0, openBrack - 1)
+			if #bstack > 0 then table.remove(bstack) end
+			i = i + 1
+		elseif c == "{" then
+			openBrace = openBrace + 1
+			bstack[#bstack + 1] = "}"
+			i = i + 1
+		elseif c == "}" then
+			openBrace = math.max(0, openBrace - 1)
+			if #bstack > 0 then table.remove(bstack) end
+			i = i + 1
+		else
+			i = i + 1
+		end
+	end
+
+	return {
+		stack = stack, bstack = bstack,
+		openParen = openParen, openBrack = openBrack, openBrace = openBrace,
+		unterminatedLong = unterminatedLong, unterminatedQuote = unterminatedQuote,
+		unterminatedQuotePos = unterminatedQuotePos,
+		lastSafe = lastSafe,
+	}
+end
+
+-- Пошаговая починка: закрываем строку, скобки, блоки — и после каждого шага
+-- перепроверяем компилятором
+local function repairSyntax(src, label)
+	local fixes = {}
+	local cur = src
+	local bal = scanBalance(cur)
+
+	-- Незакрытая обычная строка. Дописывать кавычку в конце файла нельзя
+	-- (строка "съест" перевод строки), а обрезка по позиции кавычки оставляет
+	-- "local s =" без значения. Поэтому отрезаем ВСЮ строку, на которой строка
+	-- не закрыта: хвост после кавычки всё равно был частью строки, а не кодом.
+	if bal.unterminatedQuote and bal.unterminatedQuotePos then
+		local nlPos = nil
+		for p = bal.unterminatedQuotePos - 1, 1, -1 do
+			if cur:sub(p, p) == "\n" then nlPos = p break end
+		end
+		local cut = nlPos and cur:sub(1, nlPos) or ""
+		if #cut < #cur then
+			fixes[#fixes + 1] = string.format(
+				"dropped incomplete line with unterminated string at pos %d (dropped %d bytes)",
+				bal.unterminatedQuotePos, #cur - #cut)
+			cur = cut
+		end
+	end
+	if bal.unterminatedLong then
+		cur = cur .. bal.unterminatedLong
+		fixes[#fixes + 1] = "closed unterminated long string with '" .. bal.unterminatedLong .. "'"
+	end
+
+	local function fixBrackets()
+		bal = scanBalance(cur)
+		-- закрываем в обратном порядке, иначе для "f(g([3" получится ")))"
+		local add = {}
+		for k = #bal.bstack, 1, -1 do add[#add + 1] = bal.bstack[k] end
+		if #add > 0 then
+			cur = cur .. table.concat(add)
+			fixes[#fixes + 1] = "appended " .. #add .. " closing bracket(s): " .. table.concat(add)
+			return true
+		end
+		return false
+	end
+
+	local function fixBlocks()
+		bal = scanBalance(cur)
+		if #bal.stack == 0 then return false end
+		local add = {}
+		for k = #bal.stack, 1, -1 do
+			-- "until" требует условия, голое "until" невалидно
+			add[#add + 1] = (bal.stack[k] == "repeat") and "until true" or "end"
+		end
+		cur = cur .. "\n" .. table.concat(add, "\n") .. "\n"
+		fixes[#fixes + 1] = "appended " .. #add .. " block closer(s): " .. table.concat(add, " ")
+		return true
+	end
+
+	fixBrackets()
+	fixBlocks()
+
+	local ok, err = validate(cur)
+	if ok == nil then return cur, fixes, nil, err end
+	local iter = 0
+	while not ok and iter < 6 do
+		iter = iter + 1
+		local progress = false
+		progress = fixBrackets() or progress
+		ok, err = validate(cur)
+		if ok then break end
+		progress = fixBlocks() or progress
+		ok, err = validate(cur)
+		if not progress then break end
+	end
+
+	-- последний шанс: обрезать до последней целой верхнеуровневой конструкции
+	if not ok and S.cfg.salvage then
+		bal = scanBalance(cur)
+		if bal.lastSafe > 0 and bal.lastSafe < #cur then
+			local cut = cur:sub(1, bal.lastSafe)
+			local ok2, err2 = validate(cut)
+			if ok2 then
+				cur = cut
+				fixes[#fixes + 1] = "salvaged: truncated to last complete statement ("
+					.. bal.lastSafe .. " bytes)"
+				ok, err = true, nil
+			else
+				-- обрезанный кусок тоже может требовать закрытия
+				fixBrackets()
+				fixBlocks()
+				local ok3 = validate(cur)
+				if ok3 then
+					fixes[#fixes + 1] = "salvaged: truncated to " .. bal.lastSafe .. " bytes then closed blocks"
+					ok, err = true, nil
+				end
+			end
+		end
+	end
+
+	return cur, fixes, ok, err
+end
+
+S.fixLog = {}
+function S.fixReport(line)
+	S.fixLog[#S.fixLog + 1] = line
+	if #S.fixLog > 400 then table.remove(S.fixLog, 1) end
+end
+
+function S.flushFixes()
+	if #S.fixLog > 0 then
+		S.save("syntax_fixes.txt", table.concat(S.fixLog, "\n") .. "\n")
+	end
+end
+
+-- Проверяет текст и, если он не компилируется, чинит и пишет .fixed.lua
+function S.ensureValid(base, text, kind)
+	if type(text) ~= "string" or #text < 2 then return end
+	local ok, err = validate(text)
+	if ok == nil then
+		-- компилятора нет: чинить вслепую нельзя, только сообщить
+		S.fixReport("=== " .. base .. "." .. kind .. " ===\n  skipped: " .. tostring(err))
+		return
+	end
+	if ok then return true end
+	local fixed, fixes, ok2, err2 = repairSyntax(text, base .. "." .. kind)
+	S.fixReport(string.format("=== %s.%s ===\n  error: %s\n  fixes: %s\n  result: %s",
+		base, kind, tostring(err),
+		(#fixes > 0) and table.concat(fixes, " | ") or "(none)",
+		ok2 and "COMPILES" or ("still broken: " .. tostring(err2))))
+	S.log("syntax broken in " .. base .. "." .. kind .. " -> " ..
+		(#fixes > 0) and (#fixes .. " fix(es)") or "no fix")
+	if ok2 then
+		S.save(base .. "." .. kind .. ".fixed.lua", fixed)
+	end
+	return ok2, err2
+end
+
+---------------------------------------------------------------------------
+-- 10.7 BRUTAL: глубокий обход памяти + живая расшифровка + реконструктор
+--      ГЛАВНОГО СКРИПТА (любой скрипт из памяти — фулл деобфусцированный)
+---------------------------------------------------------------------------
+-- Глубокий сбор: getgc(includeTables) + getrenv + _G/getgenv/shared +
+-- рекурсия по upvalue до deepDepth. Цепляет то, что мелкий обход не видел:
+-- зашифрованные blob-строки, вложенные VM-таблицы, скрытые прототипы.
+function S.collectDeep()
+	if not S.cfg.brutal then return {}, {} end
+	local seenT, outT = {}, {}
+	local seenF, outF = {}, {}
+	local nT, nF = 0, 0
+	local maxT = S.cfg.maxDeepTables or 60000
+	local maxF = S.cfg.maxFns or 60000
+
+	local function addT(t)
+		if type(t) ~= "table" then return end
+		local a = taddr(t)
+		if seenT[a] then return end
+		seenT[a] = true
+		nT = nT + 1
+		if nT <= maxT then outT[#outT + 1] = t end
+	end
+
+	local wDeepT, wDeepF
+	wDeepT = function(t, depth)
+		if depth > (S.cfg.deepDepth or 8) then return end
+		if nT > maxT then return end
+		local ok = pcall(pairs, t)
+		if not ok then return end
+		for k, v in pairs(t) do
+			local tv = type(v)
+			if tv == "table" then
+				addT(v)
+				wDeepT(v, depth + 1)
+			elseif tv == "function" then
+				wDeepF(v, depth + 1)
+			elseif tv == "string" and #v >= (S.cfg.blobMin or 512) then
+				-- кандидат в зашифрованный blob: длинная строка с мусором
+				local a = "blob_" .. hashStr(v)
+				if not S.blobs[a] and #S.blobs < 200 then
+					S.blobs[a] = { len = #v, head = v:sub(1, 64) }
+					S.save("deep/blob_" .. a .. ".bin", v)
+					S.save("deep/blob_" .. a .. ".info.txt",
+						"-- blob len=" .. #v .. "\n-- HEX[0..63]:\n" .. hexDump(v, 64) .. "\n")
+				end
+			end
+			if type(k) == "string" and #k >= (S.cfg.blobMin or 512) then
+				local a = "blobk_" .. hashStr(k)
+				if not S.blobs[a] and #S.blobs < 200 then
+					S.blobs[a] = { len = #k, head = k:sub(1, 64) }
+					S.save("deep/blob_" .. a .. ".bin", k)
+				end
+			end
+		end
+	end
+
+	wDeepF = function(fn, depth)
+		if type(fn) ~= "function" then return end
+		if depth > (S.cfg.deepDepth or 8) then return end
+		local key = taddr(fn)
+		if seenF[key] then return end
+		seenF[key] = true
+		nF = nF + 1
+		if nF <= maxF then outF[#outF + 1] = fn end
+		if nF > maxF then return end
+		S.fnCount = S.fnCount + 1
+		local getupval = rawget(genv, "getupvalues") or rawget(_G, "getupvalues")
+		if type(getupval) == "function" then
+			local ok, uvs = pcall(getupval, fn)
+			if ok and type(uvs) == "table" then
+				for _, uv in pairs(uvs) do
+					if type(uv) == "table" then
+						addT(uv)
+						wDeepT(uv, depth + 1)
+					elseif type(uv) == "function" then
+						wDeepF(uv, depth + 1)
+					elseif type(uv) == "string" and #uv >= (S.cfg.blobMin or 512) then
+						local a = "blob_" .. hashStr(uv)
+						if not S.blobs[a] and #S.blobs < 200 then
+							S.blobs[a] = { len = #uv, head = uv:sub(1, 64) }
+							S.save("deep/blob_" .. a .. ".bin", uv)
+						end
+					end
+				end
+			end
+		end
+		-- поля функции (наш хук держит orig)
+		for _, field in ipairs({"__profesBase"}) do
+			local ok2, v = pcall(function() return fn[field] end)
+			if ok2 and type(v) == "table" then addT(v) wDeepT(v, depth + 1) end
+		end
+	end
+
+	-- 1) getgc с таблицами (там живут Constant Pool / Instruction Array)
+	local getgcFn = rawget(genv, "getgc") or rawget(_G, "getgc")
+	if type(getgcFn) == "function" then
+		for _, inc in ipairs({true, false}) do
+			local ok, res = pcall(getgcFn, inc)
+			if ok and type(res) == "table" then
+				for _, v in ipairs(res) do
+					if type(v) == "table" then addT(v)
+					elseif type(v) == "function" then wDeepF(v, 0) end
+				end
+			end
+			-- без аргументов (некоторые реализации)
+			if inc then
+				local ok0, res0 = pcall(getgcFn)
+				if ok0 and type(res0) == "table" then
+					for _, v in ipairs(res0) do
+						if type(v) == "table" then addT(v)
+						elseif type(v) == "function" then wDeepF(v, 0) end
+					end
+				end
+			end
+		end
+	end
+
+	-- 2) корневые окружения: _G / getgenv / shared / getrenv / registry
+	for _, root in ipairs({_G, genv}) do
+		if type(root) == "table" then addT(root) wDeepT(root, 0) end
+	end
+	local sh = rawget(genv, "shared")
+	if type(sh) == "table" then addT(sh) wDeepT(sh, 1) end
+	local okR, renv = pcall(function()
+		if type(getrenv) == "function" then return getrenv() end
+	end)
+	if okR and type(renv) == "table" then addT(renv) wDeepT(renv, 1) end
+	local okReg, reg = pcall(function()
+		if type(getregistry) == "function" then return getregistry() end
+	end)
+	if okReg and type(reg) == "table" then addT(reg) wDeepT(reg, 1) end
+
+	-- 3) наши хуки + функции chunk'ов (точка входа в VM)
+	for _, name in ipairs({"loadstring", "load"}) do
+		local h = rawget(genv, name) or rawget(_G, name)
+		if type(h) == "function" then wDeepF(h, 0) end
+	end
+	for _, fn in ipairs(S.chunkFns or {}) do wDeepF(fn, 0) end
+	for _, fn in ipairs(S.seenFns or {}) do wDeepF(fn, 0) end
+
+	S.deepCount = nT
+	S.log("deep collect: tables=" .. nT .. " fns=" .. nF .. " blobs=" .. #S.blobs)
+	return outT, outF
+end
+
+-- Живой перехват расшифровки: VM гоняет константы через string.byte/char/sub
+-- и table.insert/concat. Хуки фиксируют длинные осмысленные строки в момент,
+-- когда они появляются РАСШИФРОВАННЫМИ в рантайме. Только чтение аргументов,
+-- поведение оригинала не меняется.
+local function hookLiveFn(holder, name, onCall)
+	if type(holder) ~= "table" then return end
+	local cur = rawget(holder, name)
+	if type(cur) ~= "function" then return end
+	if isOurHook(cur) then return end
+	local wrapper = function(...)
+		local r = table.pack(cur(...))
+		pcall(onCall, table.pack(...), r)
+		return table.unpack(r, 1, r.n)
+	end
+	tagHook(wrapper, cur)
+	pcall(rawset, holder, name, makeNative(wrapper))
+end
+
+function S.installLiveDecrypt()
+	if not S.cfg.liveDecrypt then return end
+	if S.liveInstalled then return end
+	S.liveInstalled = true
+	local function noteStr(s, tag)
+		if type(s) ~= "string" then return end
+		if #s < 4 or #s > 2000 then return end
+		-- осмысленная строка: буквы/цифры/пути, а не бинарный мусор
+		if not s:find("[%a][%a][%a]") then return end
+		if s:find("\0", 1, true) then return end
+		local h = hashStr(s)
+		if S.decryptedSeen[h] then return end
+		if #S.decrypted > 15000 then return end
+		S.decryptedSeen[h] = true
+		S.decrypted[#S.decrypted + 1] = { tag = tag, s = s }
+	end
+	local function scanArgs(a)
+		for i = 1, a.n do noteStr(a[i], "arg") end
+	end
+	local function scanRes(r)
+		for i = 1, r.n do noteStr(r[i], "ret") end
+	end
+	pcall(hookLiveFn, string, "char", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "sub", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, string, "byte", function(a, r) end)
+	pcall(hookLiveFn, table, "concat", function(a, r) scanRes(r) end)
+	pcall(hookLiveFn, table, "insert", function(a, r) scanArgs(a) end)
+	S.log("live decrypt hooks installed (string.char/sub, table.concat/insert)")
+end
+
+function S.flushDecrypted()
+	if #S.decrypted == 0 then return end
+	local out = { "=== DECRYPTED CONSTANTS (пойманы живой расшифровкой в рантайме) ===",
+		"Это строки, которых НЕТ в статическом Constant Pool — VM", "расшифровала их при исполнении.",
+		"" }
+	for _, e in ipairs(S.decrypted) do
+		out[#out + 1] = string.format("[%s] %q", e.tag, e.s)
+	end
+	S.save("main/DECRYPTED_CONSTANTS.txt", table.concat(out, "\n") .. "\n")
+end
+
+-- ECR-декодер: контейнер "\27LUA" + байт-ключ + EOR-поток (как в script_memory)
+local function decodeEor(data, key, startIdx, variant)
+	local n = #data
+	if n < startIdx + 8 then return nil end
+	local out = {}
+	local prev = key
+	for i = startIdx, n do
+		local b = data:byte(i)
+		local v
+		if i == startIdx and variant == 2 then v = prev
+		else v = (b + prev) % 256 prev = v end
+		out[#out + 1] = string.char(v)
+	end
+	return table.concat(out)
+end
+
+local function ecrScore(d)
+	if #d < 8 then return -999 end
+	local score = 0
+	for i = 1, 6 do
+		local b = d:byte(i)
+		if b and b <= 16 then score = score + 2 else score = score - 8 end
+	end
+	local sample = math.min(#d, 1024)
+	local printable = 0
+	for i = 1, sample do
+		local b = d:byte(i)
+		if b >= 32 and b < 127 then printable = printable + 1 end
+	end
+	return score + (printable / sample) * 6
+end
+
+function S.tryEcrDecode(data)
+	if not S.cfg.ecr then return nil end
+	if type(data) ~= "string" or #data < 40 then return nil end
+	if data:sub(1, 4) ~= "\27LUA" then return nil end
+	local head = data:sub(1, 4096)
+	local keys = {0x5D, 0x5B, 0x5C, 0x5E, 0x09, 0x2A, 0x11, 0x37, 0x00, 0xFF,
+		data:byte(4), data:byte(5), data:byte(6)}
+	local best, bK, bS, bV = -math.huge, nil, nil, nil
+	for _, key in ipairs(keys) do
+		for s = 5, 6 do
+			for v = 1, 2 do
+				local d = decodeEor(head, key, s, v)
+				if d then
+					local sc = ecrScore(d)
+					if sc > best then best, bK, bS, bV = sc, key, s, v end
+				end
+			end
+		end
+	end
+	if best < 11 or not bK then return nil end
+	local full = decodeEor(data, bK, bS, bV)
+	if not full then return nil end
+	local info = string.format("key=0x%02X start=%d variant=%d score=%.1f", bK, bS, bV, best)
+	S.ecrInfo[#S.ecrInfo + 1] = info
+	return full, info
+end
+
+function S.tryEcrOnBinary(base, data)
+	local dec, info = S.tryEcrDecode(data)
+	if dec then
+		S.save(base .. ".ecr.lua", "-- ECR auto-decoded: " .. tostring(info) .. "\n" .. dec)
+		S.log("ECR decoded: " .. tostring(info) .. " -> " .. base .. ".ecr.lua")
+		return true
+	end
+	return false
+end
+
+-- Дерево прототипов через getprotos/getconstants/getupvalues по всем функциям.
+-- Даёт структуру ГЛАВНОГО скрипта: какие функции внутри каких.
+function S.buildClosureTree(fns)
+	if not S.cap.getprotos and not (type(debug) == "table" and type(debug.getproto) == "function") then
+		-- на части мобильных экзекуторов проtos недоступны: пропускаем молча,
+		-- реконструктор всё равно соберётся из пулов и инструкций
+		return
+	end
+	local visited = {}
+	local out = S.closureTree
+	local function walk(fn, depth)
+		if type(fn) ~= "function" or depth > 10 then return end
+		local k = taddr(fn)
+		if visited[k] then return end
+		visited[k] = true
+		local pad = string.rep("  ", depth)
+		local info = {}
+		if type(debug) == "table" and type(debug.getinfo) == "function" then
+			pcall(function() info = debug.getinfo(fn, "Su") or {} end)
+		end
+		out[#out + 1] = string.format("%sfn L%s..%s params=%s vararg=%s",
+			pad, tostring(info.linedefined or "?"), tostring(info.lastlinedefined or "?"),
+			tostring(info.nparams or "?"), tostring(info.isvararg))
+		do
+			local cs = readConstants(fn)
+			if type(cs) == "table" then
+				local parts = {}
+				for _, c in pairs(cs) do
+					if type(c) == "string" and #c > 1 and #parts < 24 then
+						parts[#parts + 1] = string.format("%q", c:sub(1, 48))
+					elseif (type(c) == "number" or type(c) == "boolean") and #parts < 24 then
+						parts[#parts + 1] = tostring(c)
+					end
+				end
+				if #parts > 0 then out[#out + 1] = pad .. "  consts: " .. table.concat(parts, ", ") end
+			end
+		end
+		do
+			local uvs = readUpvalues(fn)
+			if type(uvs) == "table" then
+				local names = {}
+				for kk, uv in pairs(uvs) do
+					if type(uv) == "function" then
+						if #names < 20 then names[#names + 1] = tostring(kk) .. ":fn" end
+					elseif #names < 20 then
+						names[#names + 1] = tostring(kk) .. ":" .. type(uv)
+					end
+				end
+				if #names > 0 then out[#out + 1] = pad .. "  upvals: " .. table.concat(names, ", ") end
+				for _, uv in pairs(uvs) do
+					if type(uv) == "function" then walk(uv, depth + 1) end
+				end
+			end
+		end
+		do
+			local protos = readProtos(fn)
+			if type(protos) == "table" then
+				local list = {}
+				for kk, vv in pairs(protos) do
+					if type(vv) == "function" then list[#list + 1] = vv end
+				end
+				if #list > 0 then out[#out + 1] = pad .. "  protos: " .. #list end
+				for _, p in ipairs(list) do walk(p, depth + 1) end
+			end
+		end
+	end
+	for _, fn in ipairs(fns or S.seenFns or {}) do walk(fn, 0) end
+	if #out > 0 then
+		S.save("main/closure_tree.txt", table.concat(out, "\n") .. "\n")
+	end
+end
+
+-- РЕКОНСТРУКТОР: собирает ОДИН читаемый main/FULL_DEOBFUSCATED.lua из всего,
+-- что VM держит в памяти. Это и есть "главный скрипт фулл деобфусцированный":
+-- пулы констант с индексами, прототипы с константами, псевдокод инструкций
+-- через карту опкодов, живые регистры, closure-дерево, все строки + живая
+-- расшифровка. Опкоды рандомизированы, поэтому инструкции идут псевдокодом
+-- "OP_<hex>(...)" с подсказкой из inferOpcode — честнее, чем выдуманный Lua.
+function S.buildFullDeobfuscated()
+	local L = {}
+	L[#L + 1] = "--[[══════════════════════════════════════════════════"
+	L[#L + 1] = "  FULL DEOBFUSCATED — главный скрипт, собран из памяти VM"
+	L[#L + 1] = "  дата: " .. os.date("%Y-%m-%d %H:%M:%S")
+	L[#L + 1] = "  структур: " .. tostring(#(S.mainStructs or {}))
+	L[#L + 1] = "  опкоды рандомизированы: инструкции — псевдокод OP_<hex>"
+	L[#L + 1] = "  сопоставление: opcodes.txt + chunk_*.pretty.lua по 'line N'"
+	L[#L + 1] = "══════════════════════════════════════════════════]]"
+	L[#L + 1] = ""
+	local nPool, nInstr, nProto, nState = 0, 0, 0, 0
+
+	for idx, rec in ipairs(S.mainStructs or {}) do
+		local t = rec.t
+		if t then
+			local kind = rec.kind
+			if kind == "CONSTANT_POOL" or kind == "MIXED_TABLE" or kind == "NUMERIC_POOL" then
+				nPool = nPool + 1
+				L[#L + 1] = string.format("-- ━━━ CONSTANT POOL #%d (main/%03d_%s) ━━━", nPool, idx, kind)
+				L[#L + 1] = "local K" .. nPool .. " = {"
+				local idxs = {}
+				for k in pairs(t) do if type(k) == "number" then idxs[#idxs + 1] = k end end
+				table.sort(idxs)
+				for _, k in ipairs(idxs) do
+					if #L > 120000 then break end
+					local v = t[k]
+					local tv = type(v)
+					if tv == "string" then
+						L[#L + 1] = string.format("\t[%d] = %q,", k, v)
+					elseif tv == "number" or tv == "boolean" then
+						L[#L + 1] = string.format("\t[%d] = %s,", k, tostring(v))
+					elseif tv == "table" then
+						local parts = {}
+						for kk, vv in pairs(v) do
+							if #parts >= 8 then break end
+							parts[#parts + 1] = tostring(kk) .. "=" .. vstr(vv, 30)
+						end
+						L[#L + 1] = string.format("\t[%d] = { %s },", k, table.concat(parts, ", "))
+					else
+						L[#L + 1] = string.format("\t[%d] = <%s>,", k, tv)
+					end
+				end
+				L[#L + 1] = "}"
+				L[#L + 1] = ""
+			elseif kind == "FUNC_TABLE" then
+				nProto = nProto + 1
+				L[#L + 1] = string.format("-- ━━━ PROTO TABLE #%d (main/%03d_%s) ━━━", nProto, idx, kind)
+				local keys = {}
+				for k in pairs(t) do keys[#keys + 1] = k end
+				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+				for _, k in ipairs(keys) do
+					if #L > 120000 then break end
+					local v = t[k]
+					if type(v) == "function" then
+						local info = {}
+						if type(debug) == "table" and type(debug.getinfo) == "function" then
+							pcall(function() info = debug.getinfo(v, "Su") or {} end)
+						end
+						L[#L + 1] = string.format("-- proto[%s] params=%s vararg=%s src_line=%s",
+							tostring(k), tostring(info.nparams or "?"),
+							tostring(info.isvararg), tostring(info.linedefined or "?"))
+						L[#L + 1] = string.format("local function PROTO_%s()",
+							tostring(k):gsub("[^%w]", "_"))
+						do
+							local cs = readConstants(v)
+							if type(cs) == "table" then
+								for _, c in pairs(cs) do
+									local tc = type(c)
+									if tc == "string" and #c > 0 then
+										L[#L + 1] = string.format("\t-- const %q", c:sub(1, 120))
+									elseif tc == "number" or tc == "boolean" then
+										L[#L + 1] = string.format("\t-- const %s", tostring(c))
+									end
+									if #L > 120000 then break end
+								end
+							end
+						end
+						do
+							local uvs = readUpvalues(v)
+							if type(uvs) == "table" then
+								for kk, uv in pairs(uvs) do
+									local tu = type(uv)
+									if tu == "string" then
+										L[#L + 1] = string.format("\t-- upval %s = %q", tostring(kk), uv:sub(1, 100))
+									elseif tu == "number" or tu == "boolean" then
+										L[#L + 1] = string.format("\t-- upval %s = %s", tostring(kk), tostring(uv))
+									else
+										L[#L + 1] = string.format("\t-- upval %s: <%s>", tostring(kk), tu)
+									end
+								end
+							end
+						end
+						L[#L + 1] = "end"
+						L[#L + 1] = ""
+					end
+				end
+			elseif kind == "INSTRUCTION_ARRAY" then
+				nInstr = nInstr + 1
+				L[#L + 1] = string.format("-- ━━━ INSTRUCTIONS #%d (main/%03d_%s, псевдокод) ━━━", nInstr, idx, kind)
+				L[#L + 1] = "-- формат: PC  OP_<hex>(операнды)  -- подсказка из констант обработчика"
+				-- карта opcode -> label из уже собранного opcodeOut
+				local opLabel = {}
+				for _, line in ipairs(S.opcodeOut or {}) do
+					local num, label = line:match("%((%d+)%)%s+line%s+%S+%s+(%S+)")
+					if num then opLabel[tonumber(num)] = label end
+				end
+				local idxs = {}
+				for k in pairs(t) do if type(k) == "number" then idxs[#idxs + 1] = k end end
+				table.sort(idxs)
+				for _, k in ipairs(idxs) do
+					if #L > 120000 then L[#L + 1] = "-- << truncated >>" break end
+					local v = t[k]
+					if type(v) == "table" then
+						local op, rest = nil, {}
+						for kk, vv in pairs(v) do
+							if (kk == 1 or kk == "op" or kk == "opcode") and type(vv) == "number" then
+								op = vv
+							else
+								if #rest < 8 then rest[#rest + 1] = tostring(kk) .. "=" .. vstr(vv, 30) end
+							end
+						end
+						if op then
+							local hint = opLabel[op % 256] or opLabel[op] or "?"
+							L[#L + 1] = string.format("  [%d] OP_0x%02X(%s) -- %s", k, op % 256,
+								table.concat(rest, ", "), hint)
+						else
+							L[#L + 1] = string.format("  [%d] { %s }", k, table.concat(rest, ", "))
+						end
+					else
+						L[#L + 1] = string.format("  [%d] = %s", k, vstr(v, 80))
+					end
+				end
+				L[#L + 1] = ""
+			elseif kind == "REGISTERS" then
+				nState = nState + 1
+				L[#L + 1] = string.format("-- ━━━ LIVE STATE #%d (main/%03d_%s) ━━━", nState, idx, kind)
+				local idxs = {}
+				for k in pairs(t) do if type(k) == "number" then idxs[#idxs + 1] = k end end
+				table.sort(idxs)
+				for _, k in ipairs(idxs) do
+					if #L > 120000 then break end
+					local v = t[k]
+					if type(v) == "string" then
+						L[#L + 1] = string.format("-- R[%d] = %q", k, v:sub(1, 100))
+					else
+						L[#L + 1] = string.format("-- R[%d] = %s", k, vstr(v, 80))
+					end
+				end
+				L[#L + 1] = ""
+			end
+		end
+	end
+
+	-- живая расшифровка отдельным блоком
+	if #S.decrypted > 0 then
+		L[#L + 1] = "-- ━━━ DECRYPTED AT RUNTIME (" .. #S.decrypted .. ") ━━━"
+		for _, e in ipairs(S.decrypted) do
+			if #L > 125000 then break end
+			L[#L + 1] = string.format("-- [%s] %q", e.tag, e.s)
+		end
+		L[#L + 1] = ""
+	end
+
+	-- closure-дерево отдельным блоком
+	if #S.closureTree > 0 then
+		L[#L + 1] = "-- ━━━ CLOSURE TREE (getprotos) ━━━"
+		for _, line in ipairs(S.closureTree) do
+			if #L > 125000 then break end
+			L[#L + 1] = "-- " .. line
+		end
+		L[#L + 1] = ""
+	end
+
+	L[#L + 1] = string.format("-- pools=%d protos=%d instr=%d states=%d decrypted=%d",
+		nPool, nProto, nInstr, nState, #S.decrypted)
+	local text = table.concat(L, "\n") .. "\n"
+	S.save("main/FULL_DEOBFUSCATED.lua", text)
+	-- валидация собранного файла оригинальным компилятором
+	if S.cfg.fixSyntax then pcall(S.ensureValid, "main/FULL_DEOBFUSCATED", text, "lua") end
+	S.log(string.format("FULL_DEOBFUSCATED written: %d bytes pools=%d protos=%d instr=%d",
+		#text, nPool, nProto, nInstr))
+	return #text
+end
+
+-- BRUTAL-скан: глубокий сбор + классификация всего + дерево + реконструктор.
+-- Вызывается из scheduleScan цепочкой и из PROFES_SCAN / PROFES_MAIN.
+function S.brutalScan()
+	if not S.cfg.brutal then return 0 end
+	pcall(S.installLiveDecrypt)
+	local deepT, deepF = S.collectDeep()
+	local found = 0
+	-- классифицируем глубокие таблицы (порог ниже — цепляем средние пулы)
+	for _, t in ipairs(deepT) do
+		local a = taddr(t)
+		if not S.structs[a] then
+			local ok, st = pcall(classify, t)
+			if ok and st then
+				S.structs[a] = st
+				if st.total >= math.min(S.cfg.minTableSize, 8) and st.kind ~= "SMALL" and st.kind ~= "EMPTY" then
+					S.scanned = S.scanned + 1
+					found = found + 1
+					pcall(dumpStructure, S.scanned, t, st)
+					S.mainStructs[#S.mainStructs + 1] = { t = t, kind = st.kind, stat = st }
+				end
+			end
+		end
+	end
+	-- функции из глубокого сбора — в общий пул для dumpVMState/closure-дерева
+	for _, fn in ipairs(deepF) do S.seedFromFunction(fn) end
+	pcall(S.buildClosureTree, deepF)
+	pcall(S.flushDecrypted)
+	-- ECR по всем бинарным chunk'ам (повторно безопасно: перезаписывает тем же)
+	for _, c in ipairs(S.chunks or {}) do
+		if c.binary and c.raw then pcall(S.tryEcrOnBinary, c.ecrBase, c.raw) end
+	end
+	pcall(S.buildFullDeobfuscated)
+	if #S.structIndex > 0 then
+		S.save("structures_index.txt", table.concat(S.structIndex, "\n") .. "\n")
+	end
+	return found
 end
 
 ---------------------------------------------------------------------------
@@ -1795,12 +3268,25 @@ local function installAll()
 	installEnvHooks()
 	installShims()
 	installRemotes()
+	pcall(S.installLiveDecrypt)
 	S.log("hooks installed: " .. hookCount)
 	return hookCount
 end
 
 installAll()
 S.flush()
+-- MOBILE: долгий опрос памяти стартует сам — на телефоне структуры VM
+-- появляются поздно, одного свипа не хватает. Плюс capability-строка в лог.
+S.save("capabilities.txt", (function()
+	local c = S.cap
+	local ks = {}
+	for k in pairs(c) do ks[#ks + 1] = k end
+	table.sort(ks)
+	local o = { "=== EXECUTOR CAPABILITIES ===" }
+	for _, k in ipairs(ks) do o[#o + 1] = string.format("  %-16s %s", k, tostring(c[k])) end
+	return table.concat(o, "\n") .. "\n"
+end)())
+pcall(S.startMobilePoller)
 
 ---------------------------------------------------------------------------
 -- 13. РУЧНЫЕ КОМАНДЫ
@@ -1812,8 +3298,66 @@ end
 
 genv.PROFES_SCAN = function()
 	local n = S.scanStructures()
+	pcall(S.brutalScan)
 	S.flush()
 	print("[Profes] structures found: " .. tostring(n) .. " | " .. genv.PROFES_STATUS())
+	return n
+end
+
+-- принудительная выгрузка main-скрипта из уже найденных структур
+genv.PROFES_MAIN = function()
+	S.mainStrings = {}
+	local n = S.dumpMain()
+	local m = S.dumpVMState()
+	local b = 0
+	if S.cfg.brutal then
+		local deepT, deepF = S.collectDeep()
+		for _, t in ipairs(deepT) do
+			local a = taddr(t)
+			if not S.structs[a] then
+				local ok, st = pcall(classify, t)
+				if ok and st and st.total >= 8 and st.kind ~= "SMALL" and st.kind ~= "EMPTY" then
+					S.structs[a] = st
+					S.mainStructs[#S.mainStructs + 1] = { t = t, kind = st.kind, stat = st }
+				end
+			end
+		end
+		for _, fn in ipairs(deepF) do S.seedFromFunction(fn) end
+		pcall(S.buildClosureTree, deepF)
+		local okB, resB = pcall(S.buildFullDeobfuscated)
+		if okB and type(resB) == "number" then b = resB end
+	end
+	pcall(S.flushDecrypted)
+	S.flush()
+	print("[Profes] main dumped from " .. tostring(n) .. " structures, VM state tables: " .. tostring(m)
+		.. ", full bytes=" .. tostring(b))
+	return n
+end
+
+-- полный фулл-дамп одной командой: скан + brutal + main + flush
+genv.PROFES_FULL = function()
+	pcall(S.scanStructures)
+	pcall(S.brutalScan)
+	S.mainStrings = {}
+	pcall(S.dumpMain)
+	pcall(S.dumpVMState)
+	local b = pcall(S.buildFullDeobfuscated)
+	pcall(S.flushDecrypted)
+	S.flush()
+	pcall(S.flushFixes)
+	print("[Profes] FULL done | " .. genv.PROFES_STATUS() .. " | main/FULL_DEOBFUSCATED.lua")
+	return S.dir
+end
+
+genv.PROFES_CAPS = function()
+	for k, v in pairs(S.cap) do print("  " .. tostring(k) .. " = " .. tostring(v)) end
+	return S.cap
+end
+
+genv.PROFES_VMSTATE = function()
+	local n = S.dumpVMState()
+	S.flush()
+	print("[Profes] VM state tables: " .. tostring(n))
 	return n
 end
 
@@ -1837,10 +3381,15 @@ genv.PROFES_RETRY = function()
 end
 
 print("======================================================")
-print("  SCRIPT-PROFES v1 - RUNNING")
+print("  SCRIPT-PROFES v2 BRUTAL+MOBILE - RUNNING")
 print("  folder: workspace/" .. S.dir)
 print("  hooks: " .. hookCount)
+print("  mobile Hollow: getgc=" .. tostring(S.cap.getgc)
+	.. " protos=" .. tostring(S.cap.getprotos)
+	.. " consts=" .. tostring(S.cap.getconstants)
+	.. " upvals=" .. tostring(S.cap.canUpvals))
 print("  1) run your obfuscated script / loadstring")
-print("  2) structures are swept automatically, or PROFES_SCAN()")
+print("  2) sweeps run automatically, or PROFES_SCAN() / PROFES_FULL()")
+print("  3) main: main/FULL_DEOBFUSCATED.lua")
 print("======================================================")
 notify("Script-Profes", "Ready! " .. S.dir)
