@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -120,6 +120,7 @@ local S = {
 		hookRemotes = userCfg.hookRemotes ~= false,
 		walkChunk = userCfg.walkChunk ~= false,
 		structures = userCfg.structures ~= false,
+		quiet = userCfg.quiet == true,               -- ТИХО: только 00_READY.lua+.pretty, без каталога
 		mobile = userCfg.mobile ~= false,            -- [MOBILE] режим слабых экзекуторов
 		mobilePoll = userCfg.mobilePoll or 1.5,      -- [MOBILE] интервал опроса памяти (сек)
 		mobileSweeps = userCfg.mobileSweeps or 40,   -- [MOBILE] сколько опросов держать
@@ -1605,8 +1606,15 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	else
 		S.save(base .. ".lua", src)
 		S.log("#" .. n .. " TEXT (" .. #src .. " chars) -> " .. base .. ".lua")
+		-- МГНОВЕННЫЙ ФАЙЛ: копия целевого чанка как 00_READY.lua — один файл,
+		-- сразу, без каталога. Это максимум "настоящего скрипта", который VM
+		-- отдаёт наружу: дальше исходника в открытом виде нет, только VM-таблицы.
+		if S.armed ~= false then
+			S.save("00_READY.lua", src)
+			S.log("READY written: 00_READY.lua (" .. #src .. " chars)")
+		end
 
-		if S.cfg.analyze then
+		if not S.cfg.quiet and S.cfg.analyze then
 			local names, strs, blobs = scanLua(src)
 			for _, s in ipairs(strs) do
 				if #S.stringsOut < S.cfg.maxDumpStrings then S.stringsOut[#S.stringsOut + 1] = s end
@@ -1651,6 +1659,10 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 				if okF and type(pretty) == "string" and #pretty > 0 then
 					S.save(base .. ".pretty.lua", pretty)
 					S.log("#" .. n .. " formatted -> " .. base .. ".pretty.lua")
+					if S.armed ~= false then
+						S.save("00_READY.pretty.lua", pretty)
+						S.log("READY written: 00_READY.pretty.lua")
+					end
 					-- форматирование не ломает поток токенов, но исходник мог быть
 					-- битым изначально — проверяем и чиним
 					if S.cfg.fixSyntax then pcall(S.ensureValid, base, pretty, "pretty") end
