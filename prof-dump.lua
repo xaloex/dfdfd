@@ -1,5 +1,5 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    SCRIPT-PROFES v2 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
+    SCRIPT-PROFES v23 BRUTAL  —  дампер структур VM Luraph + ГЛАВНЫЙ СКРИПТ
 
     ПОЧЕМУ ПРЕДЫДУЩИЕ ДАМПЕРЫ УПИРАЛИСЬ В ПОТОЛОК
     ------------------------------------------------
@@ -1471,6 +1471,8 @@ end
 ---------------------------------------------------------------------------
 function S.onChunk(src, chunkname, tag, ok, compiled)
 	if type(src) == "function" then
+		-- функции мимо ARM не пускаем тоже: только после вооружения
+		if S.armed == false then return end
 		local dok, dumped = pcall(string.dump, src)
 		if dok and type(dumped) == "string" then
 			S.counter = S.counter + 1
@@ -1482,6 +1484,17 @@ function S.onChunk(src, chunkname, tag, ok, compiled)
 	if type(src) ~= "string" or #src < 2 then return end
 	if src:find("__PROFES_PROBE__", 1, true) then return end
 	if src:find(STATE_KEY, 1, true) then return end
+	-- АНТИ-СЕБЯ ПО СОДЕРЖИМОМУ: наш исходник содержит эти маркеры.
+	-- Если чанк — это мы (перезапуск/копия), не берём его никогда.
+	if src:find("FULL_DEOBFUSCATED", 1, true) and src:find("brutalScan", 1, true) then return end
+	if src:find("SCRIPT-PROFES v2", 1, true) then return end
+	-- ARM-РЕЖИМ: берём ТОЛЬКО то, что запущено ПОСЛЕ нашего скрипта.
+	-- Сперва наш дампер, потом твой loadstring — всё до взвода отсекается.
+	if S.armed == false then
+		S.log("pre-arm chunk skipped (" .. tag .. ", len=" .. #src .. ")")
+		return
+	end
+	if S.armedAt and os.clock() < S.armedAt then return end
 
 	S.counter = S.counter + 1
 	local n = S.counter
@@ -1775,20 +1788,46 @@ local function classify(t)
 		why = "маленькая"
 	end
 
-	-- SELF-CONTENT: таблица из наших строк (имена функций дампера, шим-строки,
-	-- MULTI_OPS) — не добыча. Иначе свой мусор выглядит как CONSTANT_POOL игры.
-	if kind == "CONSTANT_POOL" and vStr >= 4 and strKeys == 0 then
+	-- SELF ПО ВСЕМ ВИДАМ: раньше проверка стояла только на CONSTANT_POOL,
+	-- поэтому наши MIXED-таблицы (S, cfg, логи) проходили как добыча.
+	-- Теперь: любая таблица с нашим следом — SELF независимо от вида.
+	if kind ~= "EMPTY" and kind ~= "SMALL" then
 		local selfHit = 0
 		for _, s in ipairs(strSamples) do
 			if s:find("brutalScan", 1, true) or s:find("collectDeep", 1, true)
 				or s:find("seedFromFunction", 1, true) or s:find("scanStructures", 1, true)
 				or s:find("flushFixes", 1, true) or s:find("scheduleScan", 1, true)
-				or s:find("buildClosureTree", 1, true) or s:find("created (", 1, true)
-				or s:find("installed", 1, true) then
+				or s:find("buildClosureTree", 1, true) or s:find("harvestLive", 1, true)
+				or s:find("FULL_DEOBFUSCATED", 1, true)
+				or s:find("created (", 1, true) or s:find("installed", 1, true)
+				or s:find("__SCRIPT_PROFES", 1, true) or s:find("__profesHook", 1, true) then
 				selfHit = selfHit + 1
 			end
 		end
-		if selfHit >= 2 then
+		if selfHit == 0 then
+			-- у наших MIXED-таблиц строковых ЗНАЧЕНИЙ может не быть вовсе
+			-- (одни функции) — проверяем строковые КЛЮЧИ: cfg/shims/chunks/counter
+			local okK = pcall(function()
+				for k in pairs(t) do
+					if type(k) == "string" then
+						if k == "cfg" or k == "shims" or k == "chunks" or k == "structs"
+							or k == "mainStructs" or k == "mainStrings" or k == "decrypted"
+							or k == "closureTree" or k == "selfTables" or k == "logBuf"
+							or k == "sweepCount" or k == "chunkFns" or k == "seenFns"
+							or k == "opcodeOut" or k == "structIndex" or k == "remoteLog" then
+							selfHit = selfHit + 2
+							break
+						end
+					end
+				end
+			end)
+			if not okK then selfHit = 0 end
+		end
+		if selfHit >= 1 and vFn > 0 then
+			-- функции + наши маркеры = точно наш env/стейт
+			kind = "SELF"
+			why = "наш env/стейт (функции + маркеры дампера)"
+		elseif selfHit >= 2 then
 			kind = "SELF"
 			why = "контент дампера (имена функций/логи/шимы)"
 		end
@@ -2870,6 +2909,13 @@ function S.installLiveDecrypt()
 	local function noteStr(s, tag)
 		if type(s) ~= "string" then return end
 		if #s < 3 or #s > 4000 then return end
+		-- АНТИ-СЕБЯ: наши строки (маркеры, имена функций, шимы) не едим
+		if s:find("__SCRIPT_PROFES", 1, true) or s:find("__profesHook", 1, true)
+			or s:find("FULL_DEOBFUSCATED", 1, true) or s:find("brutalScan", 1, true)
+			or s:find("collectDeep", 1, true) or s:find("harvestLive", 1, true)
+			or s:find("buildClosureTree", 1, true) or s:find("Profes-Dump", 1, true) then
+			return
+		end
 		-- было 3 буквы подряд — резало короткие игровые ключи ("Gui", "Pet");
 		-- теперь мягче: хоть 2 буквы/цифры и без нулей
 		if not s:find("[%a][%a]") and not s:find("[%a]%d") then return end
@@ -2954,12 +3000,20 @@ function S.harvestLive()
 		if #s < 2 or #s > 4000 then return end
 		if s:find("\0", 1, true) then return end
 		if not s:find("[%a]") then return end
+		-- АНТИ-СЕБЯ: наш мусор не harvest'им
+		if s:find("__SCRIPT_PROFES", 1, true) or s:find("__profesHook", 1, true)
+			or s:find("FULL_DEOBFUSCATED", 1, true) or s:find("brutalScan", 1, true)
+			or s:find("collectDeep", 1, true) or s:find("harvestLive", 1, true)
+			or s:find("Profes-Dump", 1, true) or s:find("created (", 1, true) then
+			return
+		end
 		if #S.mainStrings > (S.cfg.maxDumpStrings or 20000) then return end
 		S.mainStrings[#S.mainStrings + 1] = s
 		got = got + 1
 	end
 	local function eatTable(t, depth)
 		if depth > 3 or #S.mainStrings > (S.cfg.maxDumpStrings or 20000) then return end
+		if isSelfTable(t) then return end
 		local ok = pcall(pairs, t)
 		if not ok then return end
 		for k, v in pairs(t) do
@@ -3504,6 +3558,12 @@ end
 
 installAll()
 S.flush()
+-- ARM: с этого момента берём чанки. Всё, что было ДО (включая наш же
+-- исходник при перезапуске), отсекается в onChunk. Схема: сперва наш
+-- скрипт, потом твой loadstring — добыча только из второго.
+S.armed = true
+S.armedAt = os.clock()
+S.log("ARMED: chunks from now on will be captured")
 -- MOBILE: долгий опрос памяти стартует сам — на телефоне структуры VM
 -- появляются поздно, одного свипа не хватает. Плюс capability-строка в лог.
 S.save("capabilities.txt", (function()
@@ -3581,6 +3641,17 @@ end
 genv.PROFES_CAPS = function()
 	for k, v in pairs(S.cap) do print("  " .. tostring(k) .. " = " .. tostring(v)) end
 	return S.cap
+end
+
+-- Перевзвести захват: всё до этого момента игнорируется, дальше берём.
+-- Жми перед запуском целевого loadstring, если дампер стоял давно.
+genv.PROFES_ARM = function()
+	S.counter = S.counter -- счётчик не трогаем, чтобы не перетереть файлы
+	S.armed = true
+	S.armedAt = os.clock()
+	S.log("RE-ARMED by user")
+	print("[Profes] ARMED — запускай целевой loadstring")
+	return true
 end
 
 genv.PROFES_VMSTATE = function()
